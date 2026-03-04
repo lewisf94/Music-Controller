@@ -1,0 +1,16 @@
+.pio
+.vscode/
+.DS_Store
+*.swp
+*.bak
+*.orig
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.exe
+*.bin
+*.hex
+archive/
