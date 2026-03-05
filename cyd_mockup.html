@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CYD Music Controller — Cover Flow Mockup</title>
+  <title>CYD Music Controller — Cover Flow</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * {
@@ -29,7 +29,6 @@
       font-weight: 600;
       margin-bottom: 8px;
       color: #fff;
-      text-shadow: 0 0 20px rgba(100, 100, 255, 0.3);
     }
 
     .subtitle {
@@ -42,10 +41,7 @@
       background: #1a1a2e;
       border-radius: 16px;
       padding: 18px;
-      box-shadow:
-        0 0 0 2px rgba(255, 255, 255, 0.08),
-        0 20px 60px rgba(0, 0, 0, 0.6),
-        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.08), 0 20px 60px rgba(0, 0, 0, 0.6);
       position: relative;
     }
 
@@ -68,7 +64,6 @@
       display: block;
       cursor: grab;
       border-radius: 4px;
-      image-rendering: auto;
     }
 
     #cyd:active {
@@ -123,26 +118,13 @@
       color: #666;
       line-height: 1.6;
     }
-
-    .review-badge {
-      position: fixed;
-      top: 16px;
-      right: 16px;
-      background: rgba(29, 185, 84, 0.15);
-      border: 1px solid rgba(29, 185, 84, 0.3);
-      padding: 8px 14px;
-      border-radius: 8px;
-      font-size: 0.65rem;
-      color: #1db954;
-      backdrop-filter: blur(10px);
-    }
   </style>
 </head>
 
 <body>
 
   <h1>🎵 CYD Cover Flow — iPod Style</h1>
-  <p class="subtitle">320 × 240 px · Drag to flip through vinyls · Tap center album to play</p>
+  <p class="subtitle">320 × 240 px · Albums rotate and fold away as you scroll</p>
 
   <div class="device-frame">
     <span class="device-label">ESP32-2432S028 (CYD)</span>
@@ -150,7 +132,7 @@
   </div>
 
   <div class="info-panel">
-    <div class="status" id="status">Drag left/right to flip through albums</div>
+    <div class="status" id="status">Swipe to flip through albums</div>
     <div class="controls">
       <button onclick="goToAlbum(0)">⏮ First</button>
       <button onclick="goToAlbum(2)">Dark Side</button>
@@ -158,19 +140,12 @@
       <button onclick="toggleSlowMotion()">🐢 Slow-Mo</button>
     </div>
     <div class="legend">
-      <strong>Cover Flow:</strong> Center album pops forward · Side albums recede like vinyl in a crate<br>
-      <strong>Optimized:</strong> Same 320×140 sprite · Integer math · ≤5 albums drawn per frame
+      <strong>3D Effect:</strong> Side albums rotate away in perspective · Center album faces you square-on<br>
+      <strong>On CYD:</strong> Simulated with horizontal squish (no GPU transforms needed)
     </div>
   </div>
 
-  <div class="review-badge">✅ CYD-optimized Cover Flow</div>
-
   <script>
-    // ===================================================================
-    // iPod-style Cover Flow — CYD-optimized
-    // Faithful to what the C++ code will produce on the ESP32
-    // ===================================================================
-
     const canvas = document.getElementById('cyd');
     const ctx = canvas.getContext('2d');
     const statusEl = document.getElementById('status');
@@ -179,285 +154,231 @@
     const SCREEN_W = 320;
     const SCREEN_H = 240;
 
-    // Cover Flow layout constants (tuned for 320x240)
-    const CENTER_SIZE = 130;   // Center album size
-    const SIDE_SIZE = 80;    // ±1 album size
-    const FAR_SIZE = 50;    // ±2 album size
+    // Cover Flow layout
+    const CENTER_SIZE = 120;
+    const SIDE_SIZE = 100;   // Height stays close, width shrinks to simulate rotation
+    const SIDE_OFFSET = 95;    // X offset for ±1 albums
+    const FAR_SIZE = 80;
+    const FAR_OFFSET = 145;
 
-    const CENTER_Y = 40;    // Y position of center album (in sprite coords)
-    const SIDE_OFFSET = 110;   // X distance of ±1 albums from center
-    const FAR_OFFSET = 170;   // X distance of ±2 albums from center
-
-    // Colors (from ui.cpp)
     const albumColors = [
-      [231, 76, 60],   // Red
-      [52, 152, 219],  // Blue
-      [46, 204, 113],  // Green
-      [243, 156, 18],   // Orange
-      [155, 89, 182],  // Purple
-      [26, 188, 156],  // Teal
+      [231, 76, 60], [52, 152, 219], [46, 204, 113],
+      [243, 156, 18], [155, 89, 182], [26, 188, 156],
     ];
+    const albumNames = ["Rumours", "OK Computer", "Dark Side", "Abbey Road", "Nevermind", "Kind of Blue"];
 
-    const albumNames = [
-      "Rumours",
-      "OK Computer",
-      "Dark Side",
-      "Abbey Road",
-      "Nevermind",
-      "Kind of Blue",
-    ];
-
-    // --- Scroll State ---
-    // scroll_pos is a float: 0.0 = album 0 centered, 1.0 = album 1 centered, etc.
+    // --- Scroll state ---
     let scroll_pos = 0.0;
     let target_scroll = 0.0;
-    const min_scroll = 0;
-    const max_scroll = ALBUM_COUNT - 1;
 
-    // --- Touch State ---
+    // --- Touch state ---
     let is_dragging = false;
     let touch_start_x = 0;
     let scroll_start = 0;
     let touch_start_time = 0;
     let momentum_velocity = 0;
     let last_tx = 0;
-
     let slowMotion = false;
 
-    // ===================================================================
-    // Drawing — Cover Flow layout
-    // ===================================================================
+    // ====== FLUID SCROLL TUNING ======
+    const DRAG_SENSITIVITY = 180;  // Higher = less twitchy
+    const MOMENTUM_MULT = 3.5;    // Subtle glide
+    const EASE_SPEED = 6.0;       // Smooth snap
+    const OVERSCROLL = 0.3;       // Subtle overscroll
 
-    function rgb(r, g, b) { return `rgb(${r},${g},${b})`; }
-    function rgba(r, g, b, a) { return `rgba(${r},${g},${b},${a})`; }
-
-    function lerp(a, b, t) {
-      t = Math.max(0, Math.min(1, t));
-      return a + (b - a) * t;
-    }
+    function lerp(a, b, t) { return a + (b - a) * Math.max(0, Math.min(1, t)); }
 
     function drawRoundRect(x, y, w, h, r, color) {
       if (w <= 0 || h <= 0) return;
       r = Math.min(r, w / 2, h / 2);
       ctx.fillStyle = color;
       ctx.beginPath();
-      ctx.moveTo(x + r, y);
-      ctx.lineTo(x + w - r, y);
-      ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-      ctx.lineTo(x + w, y + h - r);
-      ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-      ctx.lineTo(x + r, y + h);
-      ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-      ctx.lineTo(x, y + r);
-      ctx.quadraticCurveTo(x, y, x + r, y);
-      ctx.closePath();
-      ctx.fill();
+      ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+      ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+      ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+      ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+      ctx.closePath(); ctx.fill();
     }
 
-    function drawAlbumArt(cx, cy, size, colorArr, index, alpha) {
-      // cx, cy = CENTER of the album
-      const x = Math.round(cx - size / 2);
-      const y = Math.round(cy - size / 2);
-      const s = Math.round(size);
-      if (s < 10) return;
+    // Draw album art with perspective squish (scaleX < 1 = rotated away)
+    function drawAlbumArt(cx, cy, height, scaleX, colorArr, index, brightness) {
+      const h = Math.round(height);
+      const w = Math.round(height * scaleX);
+      if (w < 4 || h < 4) return;
 
-      const r = Math.max(2, Math.round(12 * (size / CENTER_SIZE)));
-      const col = rgb(colorArr[0], colorArr[1], colorArr[2]);
+      const x = Math.round(cx - w / 2);
+      const y = Math.round(cy - h / 2);
 
-      // Darken side albums
-      const dr = Math.round(colorArr[0] * alpha);
-      const dg = Math.round(colorArr[1] * alpha);
-      const db = Math.round(colorArr[2] * alpha);
-      const darkenedCol = rgb(dr, dg, db);
+      const br = Math.max(0, Math.min(1, brightness));
+      const r = Math.round(colorArr[0] * br);
+      const g = Math.round(colorArr[1] * br);
+      const b = Math.round(colorArr[2] * br);
+      const col = `rgb(${r},${g},${b})`;
+      const rad = Math.max(2, Math.round(12 * scaleX));
 
-      drawRoundRect(x, y, s, s, r, darkenedCol);
+      drawRoundRect(x, y, w, h, rad, col);
 
-      const white = `rgba(255,255,255,${alpha})`;
-      const black = `rgba(0,0,0,${alpha})`;
+      // Draw art detail (simplified for small/squished albums)
+      if (w < 30) return;
+
+      const white = `rgba(255,255,255,${br})`;
+      const black = `rgba(0,0,0,${br})`;
+
+      ctx.save();
+      // Clip to album bounds
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      ctx.clip();
 
       switch (index % 6) {
         case 0: // Vinyl
           ctx.fillStyle = black;
-          ctx.beginPath();
-          ctx.arc(cx, cy, s / 3, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = darkenedCol;
-          ctx.beginPath();
-          ctx.arc(cx, cy, s / 10, 0, Math.PI * 2);
-          ctx.fill();
+          ctx.beginPath(); ctx.ellipse(cx, cy, w * 0.33, h * 0.33, 0, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = col;
+          ctx.beginPath(); ctx.ellipse(cx, cy, w * 0.1, h * 0.1, 0, 0, Math.PI * 2); ctx.fill();
           // Grooves
-          ctx.strokeStyle = `rgba(40,40,40,${alpha * 0.5})`;
+          ctx.strokeStyle = `rgba(40,40,40,${br * 0.5})`;
           ctx.lineWidth = 0.5;
-          for (let gr = s / 5; gr < s / 3; gr += 4) {
-            ctx.beginPath();
-            ctx.arc(cx, cy, gr, 0, Math.PI * 2);
-            ctx.stroke();
+          for (let gr = h * 0.15; gr < h * 0.33; gr += 4) {
+            ctx.beginPath(); ctx.ellipse(cx, cy, gr * scaleX, gr, 0, 0, Math.PI * 2); ctx.stroke();
           }
           break;
-
         case 1: // Window
           ctx.fillStyle = white;
-          ctx.fillRect(x + s / 4, y + s / 4, s / 5, s / 5);
-          ctx.fillRect(x + s / 2 + s / 20, y + s / 4, s / 5, s / 5);
-          ctx.fillRect(x + s / 4, y + s / 2 + s / 20, s / 5, s / 5);
-          ctx.fillRect(x + s / 2 + s / 20, y + s / 2 + s / 20, s / 5, s / 5);
+          ctx.fillRect(x + w * 0.2, y + h * 0.25, w * 0.22, h * 0.2);
+          ctx.fillRect(x + w * 0.55, y + h * 0.25, w * 0.22, h * 0.2);
+          ctx.fillRect(x + w * 0.2, y + h * 0.55, w * 0.22, h * 0.2);
+          ctx.fillRect(x + w * 0.55, y + h * 0.55, w * 0.22, h * 0.2);
           break;
-
         case 2: // Prism
           ctx.fillStyle = white;
           ctx.beginPath();
-          ctx.moveTo(cx, y + s / 4);
-          ctx.lineTo(x + s / 4, y + s * 3 / 4);
-          ctx.lineTo(x + s * 3 / 4, y + s * 3 / 4);
-          ctx.closePath();
-          ctx.fill();
-          ctx.strokeStyle = white;
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(x, cy);
-          ctx.lineTo(cx, y + s / 4);
-          ctx.stroke();
+          ctx.moveTo(cx, y + h * 0.25); ctx.lineTo(x + w * 0.25, y + h * 0.75); ctx.lineTo(x + w * 0.75, y + h * 0.75);
+          ctx.closePath(); ctx.fill();
+          ctx.strokeStyle = white; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(x, cy); ctx.lineTo(cx, y + h * 0.25); ctx.stroke();
           break;
-
         case 3: // Stripes
-          ctx.fillStyle = white;
-          ctx.fillRect(x + s * 0.2, y + s * 0.2, s * 0.15, s * 0.6);
-          ctx.fillStyle = black;
-          ctx.fillRect(x + s * 0.45, y + s * 0.2, s * 0.15, s * 0.6);
-          ctx.fillStyle = white;
-          ctx.fillRect(x + s * 0.7, y + s * 0.2, s * 0.15, s * 0.6);
+          ctx.fillStyle = white; ctx.fillRect(x + w * 0.18, y + h * 0.2, w * 0.16, h * 0.6);
+          ctx.fillStyle = black; ctx.fillRect(x + w * 0.43, y + h * 0.2, w * 0.16, h * 0.6);
+          ctx.fillStyle = white; ctx.fillRect(x + w * 0.68, y + h * 0.2, w * 0.16, h * 0.6);
           break;
-
         case 4: // Waves
-          ctx.strokeStyle = white;
-          ctx.lineWidth = Math.max(1, 3 * (s / CENTER_SIZE));
+          ctx.strokeStyle = white; ctx.lineWidth = Math.max(1, 2 * scaleX);
           for (let i = 0; i < 5; i++) {
-            ctx.beginPath();
-            const yy = y + s / 5 + (i * s / 7);
-            ctx.moveTo(x + s / 6, yy);
-            ctx.lineTo(x + s * 5 / 6, yy + (i % 2 === 0 ? s * 0.07 : -s * 0.07));
-            ctx.stroke();
+            const yy = y + h * 0.18 + i * h * 0.14;
+            ctx.beginPath(); ctx.moveTo(x + w * 0.15, yy);
+            ctx.lineTo(x + w * 0.85, yy + (i % 2 === 0 ? h * 0.05 : -h * 0.05)); ctx.stroke();
           }
           break;
-
         case 5: // Blocks
-          drawRoundRect(x + s * 0.2, y + s * 0.2, s * 0.6, s * 0.3, Math.max(1, 4 * (s / CENTER_SIZE)), white);
-          drawRoundRect(x + s * 0.5, y + s * 0.6, s * 0.3, s * 0.2, Math.max(1, 4 * (s / CENTER_SIZE)), black);
-          drawRoundRect(x + s * 0.2, y + s * 0.6, s * 0.2, s * 0.2, Math.max(1, 4 * (s / CENTER_SIZE)), black);
+          drawRoundRect(x + w * 0.18, y + h * 0.2, w * 0.64, h * 0.28, 3, white);
+          drawRoundRect(x + w * 0.5, y + h * 0.58, w * 0.3, h * 0.2, 3, black);
+          drawRoundRect(x + w * 0.18, y + h * 0.58, w * 0.24, h * 0.2, 3, black);
           break;
       }
+      ctx.restore();
     }
 
-    // Compute Cover Flow position for an album given its distance from center
+    // Cover Flow transform: returns { height, scaleX, xPos, brightness }
     function getCoverFlowTransform(offset) {
-      // offset: float distance from center (0 = center, 1 = one album away, etc.)
       const absOff = Math.abs(offset);
       const sign = offset < 0 ? -1 : (offset > 0 ? 1 : 0);
 
-      let size, xPos, alpha;
+      let height, scaleX, xPos, brightness;
 
       if (absOff <= 1.0) {
-        // Interpolate between center and side position
-        size = lerp(CENTER_SIZE, SIDE_SIZE, absOff);
-        xPos = SCREEN_W / 2 + sign * lerp(0, SIDE_OFFSET, absOff);
-        alpha = lerp(1.0, 0.65, absOff);
+        // Center → side: album rotates from square to angled
+        height = lerp(CENTER_SIZE, SIDE_SIZE, absOff);
+        scaleX = lerp(1.0, 0.55, absOff);   // Less extreme rotation
+        xPos = SCREEN_W / 2 + sign * lerp(0, SIDE_OFFSET, Math.pow(absOff, 0.7));
+        brightness = lerp(1.0, 0.6, absOff);
       } else if (absOff <= 2.0) {
-        // Interpolate between side and far position
         const t = absOff - 1.0;
-        size = lerp(SIDE_SIZE, FAR_SIZE, t);
+        height = lerp(SIDE_SIZE, FAR_SIZE, t);
+        scaleX = lerp(0.55, 0.40, t);
         xPos = SCREEN_W / 2 + sign * lerp(SIDE_OFFSET, FAR_OFFSET, t);
-        alpha = lerp(0.65, 0.35, t);
+        brightness = lerp(0.6, 0.35, t);
       } else {
-        // Beyond ±2: off screen or very small
         const t = Math.min(absOff - 2.0, 1.0);
-        size = lerp(FAR_SIZE, 20, t);
-        xPos = SCREEN_W / 2 + sign * lerp(FAR_OFFSET, SCREEN_W / 2 + 40, t);
-        alpha = lerp(0.35, 0.0, t);
+        height = lerp(FAR_SIZE, 40, t);
+        scaleX = lerp(0.40, 0.25, t);
+        xPos = SCREEN_W / 2 + sign * lerp(FAR_OFFSET, SCREEN_W / 2 + 30, t);
+        brightness = lerp(0.35, 0.0, t);
       }
 
-      return { size, xPos, alpha };
+      return { height, scaleX, xPos, brightness };
     }
 
     function draw_ui() {
-      // Background: subtle gradient (simulates what we'd do with fillRect bands on CYD)
+      // Dark gradient background
       const grad = ctx.createLinearGradient(0, 0, 0, SCREEN_H);
       grad.addColorStop(0, '#0a0a14');
-      grad.addColorStop(0.45, '#0d0d1a');
-      grad.addColorStop(0.55, '#0d0d1a');
+      grad.addColorStop(0.5, '#0d0d1a');
       grad.addColorStop(1, '#060610');
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
 
-      // Reflective floor line (iPod-style)
-      const floorY = CENTER_Y + CENTER_SIZE + 8 + (SCREEN_H - 140) / 2;
+      const centerY = SCREEN_H / 2 - 10;
+
+      // Reflective floor line
+      const floorY = centerY + CENTER_SIZE / 2 + 12;
       const lineGrad = ctx.createLinearGradient(40, floorY, SCREEN_W - 40, floorY);
       lineGrad.addColorStop(0, 'rgba(255,255,255,0)');
-      lineGrad.addColorStop(0.3, 'rgba(255,255,255,0.08)');
-      lineGrad.addColorStop(0.5, 'rgba(255,255,255,0.12)');
-      lineGrad.addColorStop(0.7, 'rgba(255,255,255,0.08)');
+      lineGrad.addColorStop(0.3, 'rgba(255,255,255,0.06)');
+      lineGrad.addColorStop(0.5, 'rgba(255,255,255,0.1)');
+      lineGrad.addColorStop(0.7, 'rgba(255,255,255,0.06)');
       lineGrad.addColorStop(1, 'rgba(255,255,255,0)');
       ctx.fillStyle = lineGrad;
       ctx.fillRect(30, floorY, SCREEN_W - 60, 1);
 
-      // Compute Y offset (center albums vertically in sprite area)
-      const spriteY = (SCREEN_H - 140) / 2;
-
-      // Collect albums with their transforms for painter's algorithm (draw far ones first)
+      // Collect and sort albums (painter's algorithm)
       const items = [];
       for (let i = 0; i < ALBUM_COUNT; i++) {
         const offset = i - scroll_pos;
         const tf = getCoverFlowTransform(offset);
-        if (tf.alpha > 0.01 && tf.size > 5) {
+        if (tf.brightness > 0.01 && tf.height > 5) {
           items.push({ index: i, offset, ...tf });
         }
       }
-
-      // Sort by absolute offset descending (far albums drawn first = behind)
       items.sort((a, b) => Math.abs(b.offset) - Math.abs(a.offset));
 
+      // Draw albums
       for (const item of items) {
-        const cy = spriteY + CENTER_Y + item.size / 2 + (CENTER_SIZE - item.size) / 2;
-        drawAlbumArt(item.xPos, cy, item.size, albumColors[item.index], item.index, item.alpha);
+        drawAlbumArt(item.xPos, centerY, item.height, item.scaleX,
+          albumColors[item.index], item.index, item.brightness);
       }
 
-      // Draw center album name
+      // Center album name (fades in/out)
       const centerIndex = Math.round(scroll_pos);
-      const clampedCenter = Math.max(0, Math.min(ALBUM_COUNT - 1, centerIndex));
-      const nameAlpha = 1.0 - Math.min(1, Math.abs(scroll_pos - clampedCenter) * 2.5);
+      const clamped = Math.max(0, Math.min(ALBUM_COUNT - 1, centerIndex));
+      const nameAlpha = 1.0 - Math.min(1, Math.abs(scroll_pos - clamped) * 3);
 
       if (nameAlpha > 0.05) {
         ctx.fillStyle = `rgba(255,255,255,${nameAlpha})`;
         ctx.font = '600 14px Inter, sans-serif';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        ctx.fillText(albumNames[clampedCenter], SCREEN_W / 2, spriteY + CENTER_Y + CENTER_SIZE + 14);
+        ctx.fillText(albumNames[clamped], SCREEN_W / 2, centerY + CENTER_SIZE / 2 + 18);
       }
 
       // Dot indicators
       const dotY = SCREEN_H - 12;
       for (let i = 0; i < ALBUM_COUNT; i++) {
-        const dist = Math.abs(i - scroll_pos);
-        const dotAlpha = dist < 0.5 ? 0.9 : 0.2;
-        ctx.fillStyle = `rgba(255,255,255,${dotAlpha})`;
+        ctx.fillStyle = Math.abs(i - scroll_pos) < 0.5 ? 'rgba(255,255,255,0.9)' : 'rgba(255,255,255,0.2)';
         ctx.beginPath();
         ctx.arc(SCREEN_W / 2 + (i - (ALBUM_COUNT - 1) / 2) * 14, dotY, 2.5, 0, Math.PI * 2);
         ctx.fill();
       }
     }
 
-    // ===================================================================
-    // Touch / Physics — same momentum + snap logic, adapted for float scroll
-    // ===================================================================
-
-    const DRAG_SENSITIVITY = 180; // pixels of drag per one album scroll
+    // ====== TOUCH / PHYSICS (more fluid) ======
 
     canvas.addEventListener('mousedown', (e) => {
       const rect = canvas.getBoundingClientRect();
       const tx = (e.clientX - rect.left) * (SCREEN_W / rect.width);
-
       is_dragging = true;
-      touch_start_x = tx;
-      last_tx = tx;
+      touch_start_x = tx; last_tx = tx;
       scroll_start = scroll_pos;
       touch_start_time = performance.now();
       momentum_velocity = 0;
@@ -468,17 +389,12 @@
       if (!is_dragging) return;
       const rect = canvas.getBoundingClientRect();
       const tx = (e.clientX - rect.left) * (SCREEN_W / rect.width);
-
       const dx = tx - touch_start_x;
       scroll_pos = scroll_start - dx / DRAG_SENSITIVITY;
-
       momentum_velocity = (last_tx - tx) / DRAG_SENSITIVITY;
       last_tx = tx;
-
-      // Soft boundaries (overscroll)
-      if (scroll_pos < min_scroll - 0.6) scroll_pos = min_scroll - 0.6;
-      if (scroll_pos > max_scroll + 0.6) scroll_pos = max_scroll + 0.6;
-
+      if (scroll_pos < -OVERSCROLL) scroll_pos = -OVERSCROLL;
+      if (scroll_pos > ALBUM_COUNT - 1 + OVERSCROLL) scroll_pos = ALBUM_COUNT - 1 + OVERSCROLL;
       target_scroll = scroll_pos;
     });
 
@@ -486,128 +402,79 @@
       if (!is_dragging) return;
       is_dragging = false;
       canvas.style.cursor = 'grab';
-
       const duration = performance.now() - touch_start_time;
       const totalDrag = Math.abs(scroll_pos - scroll_start);
 
-      // Tap detection
-      if (totalDrag < 0.08 && duration < 300) {
-        const centerIndex = Math.round(scroll_pos);
-        if (centerIndex >= 0 && centerIndex < ALBUM_COUNT) {
-          statusEl.innerHTML = `Tapped: <span class="album-name">${albumNames[centerIndex]}</span> — spotify_play_album() would fire`;
+      if (totalDrag < 0.06 && duration < 300) {
+        const ci = Math.round(scroll_pos);
+        if (ci >= 0 && ci < ALBUM_COUNT) {
+          statusEl.innerHTML = `Tapped: <span class="album-name">${albumNames[ci]}</span> — spotify_play_album()`;
         }
+        target_scroll = Math.round(scroll_pos);
         return;
       }
 
-      // Flick: apply momentum
-      target_scroll = scroll_pos + (momentum_velocity * 3.5);
-
-      // Hard boundaries
-      if (target_scroll < min_scroll) target_scroll = min_scroll;
-      if (target_scroll > max_scroll) target_scroll = max_scroll;
-
-      // Snap to nearest album
+      target_scroll = scroll_pos + momentum_velocity * MOMENTUM_MULT;
+      target_scroll = Math.max(0, Math.min(ALBUM_COUNT - 1, target_scroll));
       let closest = Math.round(target_scroll);
-      if (closest < 0) closest = 0;
-      if (closest >= ALBUM_COUNT) closest = ALBUM_COUNT - 1;
+      closest = Math.max(0, Math.min(ALBUM_COUNT - 1, closest));
       target_scroll = closest;
-
       statusEl.innerHTML = `Snapping to: <span class="album-name">${albumNames[closest]}</span>`;
     }
 
     canvas.addEventListener('mouseup', (e) => {
       const rect = canvas.getBoundingClientRect();
-      const tx = (e.clientX - rect.left) * (SCREEN_W / rect.width);
-      const ty = (e.clientY - rect.top) * (SCREEN_H / rect.height);
-      handleRelease(tx, ty);
+      handleRelease((e.clientX - rect.left) * (SCREEN_W / rect.width), (e.clientY - rect.top) * (SCREEN_H / rect.height));
     });
+    canvas.addEventListener('mouseleave', () => { if (is_dragging) handleRelease(0, 0); });
 
-    canvas.addEventListener('mouseleave', (e) => {
-      if (is_dragging) {
-        const rect = canvas.getBoundingClientRect();
-        handleRelease(0, 0);
-      }
-    });
-
-    // Touch events for mobile
+    // Touch events
     canvas.addEventListener('touchstart', (e) => {
       e.preventDefault();
       const rect = canvas.getBoundingClientRect();
-      const touch = e.touches[0];
-      const tx = (touch.clientX - rect.left) * (SCREEN_W / rect.width);
-
-      is_dragging = true;
-      touch_start_x = tx;
-      last_tx = tx;
-      scroll_start = scroll_pos;
-      touch_start_time = performance.now();
-      momentum_velocity = 0;
+      const t = e.touches[0];
+      const tx = (t.clientX - rect.left) * (SCREEN_W / rect.width);
+      is_dragging = true; touch_start_x = tx; last_tx = tx;
+      scroll_start = scroll_pos; touch_start_time = performance.now(); momentum_velocity = 0;
     }, { passive: false });
 
     canvas.addEventListener('touchmove', (e) => {
-      e.preventDefault();
-      if (!is_dragging) return;
+      e.preventDefault(); if (!is_dragging) return;
       const rect = canvas.getBoundingClientRect();
-      const touch = e.touches[0];
-      const tx = (touch.clientX - rect.left) * (SCREEN_W / rect.width);
-
-      const dx = tx - touch_start_x;
-      scroll_pos = scroll_start - dx / DRAG_SENSITIVITY;
+      const tx = (e.touches[0].clientX - rect.left) * (SCREEN_W / rect.width);
+      scroll_pos = scroll_start - (tx - touch_start_x) / DRAG_SENSITIVITY;
       momentum_velocity = (last_tx - tx) / DRAG_SENSITIVITY;
       last_tx = tx;
-
-      if (scroll_pos < min_scroll - 0.6) scroll_pos = min_scroll - 0.6;
-      if (scroll_pos > max_scroll + 0.6) scroll_pos = max_scroll + 0.6;
+      if (scroll_pos < -OVERSCROLL) scroll_pos = -OVERSCROLL;
+      if (scroll_pos > ALBUM_COUNT - 1 + OVERSCROLL) scroll_pos = ALBUM_COUNT - 1 + OVERSCROLL;
       target_scroll = scroll_pos;
     }, { passive: false });
 
     canvas.addEventListener('touchend', (e) => {
       e.preventDefault();
       const rect = canvas.getBoundingClientRect();
-      const touch = e.changedTouches[0];
-      const tx = (touch.clientX - rect.left) * (SCREEN_W / rect.width);
-      const ty = (touch.clientY - rect.top) * (SCREEN_H / rect.height);
-      handleRelease(tx, ty);
+      const t = e.changedTouches[0];
+      handleRelease((t.clientX - rect.left) * (SCREEN_W / rect.width), (t.clientY - rect.top) * (SCREEN_H / rect.height));
     }, { passive: false });
 
-    // ===================================================================
-    // Animation Loop
-    // ===================================================================
+    // ====== ANIMATION ======
 
-    let lastScrollPos = -999;
-
+    let lastSP = -999;
     function animate() {
       if (!is_dragging && Math.abs(scroll_pos - target_scroll) > 0.001) {
         const diff = target_scroll - scroll_pos;
-        const speed = slowMotion ? 16 : 5;
+        const speed = slowMotion ? 12 : EASE_SPEED;
         scroll_pos += diff / speed;
-
-        if (Math.abs(diff) < 0.005) {
-          scroll_pos = target_scroll;
-        }
+        if (Math.abs(diff) < 0.003) scroll_pos = target_scroll;
       }
-
-      if (scroll_pos !== lastScrollPos || is_dragging) {
-        draw_ui();
-        lastScrollPos = scroll_pos;
-      }
-
+      if (scroll_pos !== lastSP || is_dragging) { draw_ui(); lastSP = scroll_pos; }
       requestAnimationFrame(animate);
     }
 
-    function goToAlbum(index) {
-      target_scroll = index;
-      statusEl.innerHTML = `Scrolling to: <span class="album-name">${albumNames[index]}</span>`;
-    }
+    function goToAlbum(i) { target_scroll = i; statusEl.innerHTML = `<span class="album-name">${albumNames[i]}</span>`; }
+    function toggleSlowMotion() { slowMotion = !slowMotion; statusEl.textContent = slowMotion ? '🐢 Slow-motion ON' : 'Normal speed'; }
 
-    function toggleSlowMotion() {
-      slowMotion = !slowMotion;
-      statusEl.textContent = slowMotion ? '🐢 Slow-motion ON — watch the Cover Flow easing!' : 'Normal speed restored';
-    }
-
-    // Init
-    draw_ui();
-    animate();
+    draw_ui(); animate();
   </script>
 </body>
 
