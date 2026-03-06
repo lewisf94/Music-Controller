@@ -14,3 +14,8 @@
 *.bin
 *.hex
 archive/
+
+# Album art (personal/copyright - do not commit)
+scripts/input_albums/
+scripts/sd_card_albums/
+src/album_art/album_*.h

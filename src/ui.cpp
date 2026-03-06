@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "spotify.h"
 #include <Arduino.h>
+#include <SD.h>
 #include <TFT_eSPI.h>
 
 extern TFT_eSPI tft;
@@ -10,51 +11,60 @@ extern bool get_touch_coords(int16_t *x, int16_t *y);
 TFT_eSprite spr = TFT_eSprite(&tft);
 static bool sprite_created = false;
 
-#define ALBUM_COUNT 6
+// --- Album Capacity ---
+#define MAX_ALBUMS 100
+static int album_count = 0; // Actual number loaded from SD
+
 #define SCREEN_W 320
 #define SCREEN_H 240
 
 // Cover Flow layout — albums rotate away from center
-#define CENTER_SIZE 120 // Full-size center album (height & width)
-#define SIDE_SIZE 100   // Side album height (width = height * scaleX)
-#define FAR_SIZE 80     // Far album height
-#define SIDE_OFFSET 95  // X position offset for ±1 albums
-#define FAR_OFFSET 145  // X position offset for ±2 albums
-#define SPRITE_H 140    // Sprite buffer height (320*140*2 = 89.6KB, within RAM)
+#define CENTER_SIZE 120
+#define SIDE_SIZE 100
+#define FAR_SIZE 80
+#define SIDE_OFFSET 95
+#define FAR_OFFSET 145
+#define SPRITE_H 140
+#define IMG_SRC_SIZE 120
+#define IMG_PIXELS (IMG_SRC_SIZE * IMG_SRC_SIZE)
 
-// Colors
-static uint16_t album_colors[ALBUM_COUNT] = {
-    tft.color565(231, 76, 60),  tft.color565(52, 152, 219),
-    tft.color565(46, 204, 113), tft.color565(243, 156, 18),
-    tft.color565(155, 89, 182), tft.color565(26, 188, 156),
-};
+// --- Per-Album Metadata (loaded from SD metadata.csv) ---
+static char album_filenames[MAX_ALBUMS][64];
+static char album_titles[MAX_ALBUMS][32];
+static char album_artists[MAX_ALBUMS][24];
+static char album_uris[MAX_ALBUMS][48];
 
-// Pre-computed dimmed colors for side albums (~55% brightness)
-static uint16_t album_colors_dim[ALBUM_COUNT] = {
-    tft.color565(127, 42, 33), tft.color565(29, 84, 120),
-    tft.color565(25, 112, 62), tft.color565(134, 86, 10),
-    tft.color565(85, 49, 100), tft.color565(14, 103, 86),
-};
+// --- 3-Slot SD Image Cache (LRU, heap-allocated) ---
+extern bool sd_ok;
+#define CACHE_SLOTS 3
+static uint16_t *sd_img_cache[CACHE_SLOTS] = {nullptr, nullptr, nullptr};
+static int cache_album_idx[CACHE_SLOTS] = {-1, -1, -1};
+static unsigned long cache_access_time[CACHE_SLOTS] = {0, 0, 0};
 
-// Pre-computed far colors (~30% brightness)
-static uint16_t album_colors_far[ALBUM_COUNT] = {
-    tft.color565(69, 23, 18), tft.color565(16, 46, 66),
-    tft.color565(14, 61, 34), tft.color565(73, 47, 5),
-    tft.color565(47, 27, 55), tft.color565(8, 56, 47),
-};
+static uint16_t fallback_color = 0x4208;
 
-static const char *album_names[ALBUM_COUNT] = {
-    "Rumours",    "OK Computer", "Dark Side",
-    "Abbey Road", "Nevermind",   "Kind of Blue",
-};
-
-static const char *album_uris[ALBUM_COUNT] = {
-    "spotify:album:1bt6q2SruMsDkOWCNLXVW2",
-    "spotify:album:6dVIqQ8qmQ5GBnJ9s5QvGg",
-    "spotify:album:4FR8Z6TvIsC56NLyNomNRE",
-    "spotify:album:0ETFjACtuP2ADo6LFhL6HN",
-    "spotify:album:2guirTSEqLizK7j9i1MTTZ",
-    "spotify:album:1kbwkEYzzPiJki3tLhE1R3"};
+static void initCache() {
+  for (int s = 0; s < CACHE_SLOTS; s++) {
+    if (!sd_img_cache[s]) {
+      // Check if enough heap remains (need 28.8KB + margin)
+      if (ESP.getFreeHeap() < 40000) {
+        Serial.print("Not enough heap for cache slot ");
+        Serial.println(s);
+        break;
+      }
+      sd_img_cache[s] = (uint16_t *)malloc(IMG_PIXELS * 2);
+      if (sd_img_cache[s]) {
+        Serial.print("Cache slot ");
+        Serial.print(s);
+        Serial.println(" OK");
+      } else {
+        Serial.print("Cache slot ");
+        Serial.print(s);
+        Serial.println(" malloc failed");
+      }
+    }
+  }
+}
 
 // --- Scroll State (fixed-point, x100) ---
 static int32_t scroll_pos = 0;
@@ -62,10 +72,10 @@ static int32_t target_scroll = 0;
 #define SCROLL_SCALE 100
 
 // --- Fluid Scroll Tuning ---
-#define DRAG_SENSITIVITY 180 // Pixels per album (higher = less twitchy)
-#define MOMENTUM_MULT 35     // /10 = 3.5x momentum (subtle glide)
-#define EASE_DIVISOR 6       // Easing speed
-#define OVERSCROLL_LIMIT 30  // 0.3 * SCROLL_SCALE
+#define DRAG_SENSITIVITY 180
+#define MOMENTUM_MULT 35
+#define EASE_DIVISOR 6
+#define OVERSCROLL_LIMIT 30
 
 // --- Touch State ---
 static bool is_dragging = false;
@@ -75,6 +85,211 @@ static unsigned long touch_start_time = 0;
 static int32_t momentum_velocity = 0;
 static int16_t last_tx = 0;
 
+// ============================================================
+// SD Card Album Loading
+// ============================================================
+
+// Parse one CSV line into fields (handles quoted fields with commas)
+static int parseCsvLine(char *line, char *fields[], int maxFields) {
+  int count = 0;
+  char *p = line;
+  while (*p && count < maxFields) {
+    if (*p == '"') {
+      p++;
+      fields[count] = p;
+      while (*p && !(*p == '"' && (*(p + 1) == ',' || *(p + 1) == '\0' ||
+                                   *(p + 1) == '\r' || *(p + 1) == '\n')))
+        p++;
+      if (*p == '"')
+        *p++ = '\0';
+      if (*p == ',')
+        p++;
+    } else {
+      fields[count] = p;
+      while (*p && *p != ',' && *p != '\r' && *p != '\n')
+        p++;
+      if (*p == ',')
+        *p++ = '\0';
+      else if (*p)
+        *p++ = '\0';
+    }
+    count++;
+  }
+  return count;
+}
+
+static void loadAlbumsFromSD() {
+  if (!sd_ok) {
+    Serial.println("SD not available, no albums loaded");
+    return;
+  }
+
+  Serial.println("SD card mounted. Scanning /sd_card_albums/...");
+
+  File dir = SD.open("/sd_card_albums");
+  if (!dir) {
+    Serial.println("ERROR: /sd_card_albums folder not found!");
+    return;
+  }
+  int fileCount = 0;
+  while (File entry = dir.openNextFile()) {
+    Serial.print("  Found: ");
+    Serial.println(entry.name());
+    fileCount++;
+    entry.close();
+  }
+  dir.close();
+  Serial.print("Total files in folder: ");
+  Serial.println(fileCount);
+
+  File f = SD.open("/sd_card_albums/metadata.csv", FILE_READ);
+  if (!f) {
+    Serial.println("ERROR: metadata.csv not found!");
+    return;
+  }
+
+  char lineBuf[256];
+  album_count = 0;
+
+  while (f.available() && album_count < MAX_ALBUMS) {
+    int len = 0;
+    while (f.available() && len < 255) {
+      char c = f.read();
+      if (c == '\n')
+        break;
+      if (c != '\r')
+        lineBuf[len++] = c;
+    }
+    lineBuf[len] = '\0';
+    if (len == 0)
+      continue;
+
+    char *fields[4] = {nullptr, nullptr, nullptr, nullptr};
+    int fieldCount = parseCsvLine(lineBuf, fields, 4);
+    if (fieldCount < 3)
+      continue;
+
+    int i = album_count;
+    strncpy(album_filenames[i], fields[0], 63);
+    album_filenames[i][63] = '\0';
+    strncpy(album_titles[i], fields[1], 31);
+    album_titles[i][31] = '\0';
+    strncpy(album_artists[i], fields[2], 23);
+    album_artists[i][23] = '\0';
+    if (fieldCount >= 4 && fields[3]) {
+      strncpy(album_uris[i], fields[3], 47);
+      album_uris[i][47] = '\0';
+    } else {
+      album_uris[i][0] = '\0';
+    }
+
+    // Verify this file actually exists on SD
+    char path[128];
+    snprintf(path, sizeof(path), "/sd_card_albums/%s", album_filenames[i]);
+    File test = SD.open(path, FILE_READ);
+    if (test) {
+      test.close();
+      album_count++;
+    } else {
+      Serial.print("SKIP (file not found): ");
+      Serial.println(path);
+    }
+  }
+  f.close();
+
+  Serial.print("Loaded ");
+  Serial.print(album_count);
+  Serial.println(" albums from SD card");
+}
+
+// ============================================================
+// Image Loading & Drawing
+// ============================================================
+
+// Find a cache slot for an album (returns slot index, or -1 on failure)
+static int loadAlbumImage(int index) {
+  if (!sd_ok || index < 0 || index >= album_count)
+    return -1;
+
+  // Check if already cached
+  for (int s = 0; s < CACHE_SLOTS; s++) {
+    if (cache_album_idx[s] == index && sd_img_cache[s]) {
+      cache_access_time[s] = millis();
+      return s;
+    }
+  }
+
+  // Find LRU slot — only consider slots that were successfully allocated
+  int lru = -1;
+  for (int s = 0; s < CACHE_SLOTS; s++) {
+    if (!sd_img_cache[s])
+      continue; // Skip failed slots
+    if (lru == -1 || cache_access_time[s] < cache_access_time[lru])
+      lru = s;
+  }
+  if (lru == -1)
+    return -1; // No usable cache slots
+
+  // Read from SD
+  char path[128];
+  snprintf(path, sizeof(path), "/sd_card_albums/%s", album_filenames[index]);
+
+  File f = SD.open(path, FILE_READ);
+  if (!f)
+    return -1;
+
+  size_t bytesRead = f.read((uint8_t *)sd_img_cache[lru], IMG_PIXELS * 2);
+  f.close();
+
+  if (bytesRead != (size_t)(IMG_PIXELS * 2))
+    return -1;
+
+  // Byte-swap: .bin files are big-endian, ESP32 is little-endian
+  for (int i = 0; i < IMG_PIXELS; i++) {
+    uint16_t v = sd_img_cache[lru][i];
+    sd_img_cache[lru][i] = (v >> 8) | (v << 8);
+  }
+
+  cache_album_idx[lru] = index;
+  cache_access_time[lru] = millis();
+  return lru;
+}
+
+static void drawScaledImage(const uint16_t *src, int srcW, int srcH, int dx,
+                            int dy, int dstW, int dstH) {
+  if (dstW == srcW && dstH == srcH) {
+    // Fast path: no scaling, use pushImage with byte swap for SPI
+    spr.setSwapBytes(true);
+    spr.pushImage(dx, dy, srcW, srcH, src);
+    spr.setSwapBytes(false);
+  } else {
+    // Nearest-neighbor downscale via drawPixel (no swap needed)
+    for (int y = 0; y < dstH; y++) {
+      int srcY = y * srcH / dstH;
+      for (int x = 0; x < dstW; x++) {
+        int srcX = x * srcW / dstW;
+        spr.drawPixel(dx + x, dy + y, src[srcY * srcW + srcX]);
+      }
+    }
+  }
+}
+
+static void drawAlbumArt(int x, int y, int w, int h, int index) {
+  if (w < 6 || h < 6)
+    return;
+
+  int slot = loadAlbumImage(index);
+  if (slot >= 0) {
+    drawScaledImage(sd_img_cache[slot], IMG_SRC_SIZE, IMG_SRC_SIZE, x, y, w, h);
+  } else {
+    spr.fillRoundRect(x, y, w, h, 4, fallback_color);
+  }
+}
+
+// ============================================================
+// Cover Flow Layout
+// ============================================================
+
 static int32_t iLerp(int32_t a, int32_t b, int32_t t) {
   if (t <= 0)
     return a;
@@ -83,99 +298,25 @@ static int32_t iLerp(int32_t a, int32_t b, int32_t t) {
   return a + ((b - a) * t) / 100;
 }
 
-// Draw album art at given position and width (width < height = rotated look)
-static void drawAlbumArt(int x, int y, int w, int h, uint16_t color,
-                         int index) {
-  if (w < 6 || h < 6)
-    return;
-
-  int r = max(2, 12 * w / CENTER_SIZE);
-  spr.fillRoundRect(x, y, w, h, r, color);
-
-  // Skip detail on very small albums
-  if (w < 25)
-    return;
-
-  uint16_t white = TFT_WHITE;
-  uint16_t black = TFT_BLACK;
-  int cx = x + w / 2;
-  int cy = y + h / 2;
-
-  switch (index % 6) {
-  case 0: // Vinyl — ellipse to show rotation
-    spr.fillEllipse(cx, cy, w / 3, h / 3, black);
-    spr.fillEllipse(cx, cy, w / 10, h / 10, color);
-    break;
-  case 1: // Window
-    spr.fillRect(x + w * 20 / 100, y + h * 25 / 100, w * 22 / 100, h * 20 / 100,
-                 white);
-    spr.fillRect(x + w * 55 / 100, y + h * 25 / 100, w * 22 / 100, h * 20 / 100,
-                 white);
-    spr.fillRect(x + w * 20 / 100, y + h * 55 / 100, w * 22 / 100, h * 20 / 100,
-                 white);
-    spr.fillRect(x + w * 55 / 100, y + h * 55 / 100, w * 22 / 100, h * 20 / 100,
-                 white);
-    break;
-  case 2: // Prism
-    spr.fillTriangle(cx, y + h / 4, x + w / 4, y + h * 3 / 4, x + w * 3 / 4,
-                     y + h * 3 / 4, white);
-    spr.drawLine(x, cy, cx, y + h / 4, white);
-    break;
-  case 3: // Stripes
-    spr.fillRect(x + w * 18 / 100, y + h * 20 / 100, w * 16 / 100, h * 60 / 100,
-                 white);
-    spr.fillRect(x + w * 43 / 100, y + h * 20 / 100, w * 16 / 100, h * 60 / 100,
-                 black);
-    spr.fillRect(x + w * 68 / 100, y + h * 20 / 100, w * 16 / 100, h * 60 / 100,
-                 white);
-    break;
-  case 4: // Waves
-    for (int i = 0; i < 5; i++) {
-      int yy = y + h * 18 / 100 + i * h * 14 / 100;
-      int y2 = yy + (i % 2 == 0 ? h * 5 / 100 : -h * 5 / 100);
-      spr.drawWideLine(x + w * 15 / 100, yy, x + w * 85 / 100, y2,
-                       max(1, 2 * w / CENTER_SIZE), white);
-    }
-    break;
-  case 5: // Blocks
-    spr.fillRoundRect(x + w * 18 / 100, y + h * 20 / 100, w * 64 / 100,
-                      h * 28 / 100, max(1, 3 * w / CENTER_SIZE), white);
-    spr.fillRoundRect(x + w * 50 / 100, y + h * 58 / 100, w * 30 / 100,
-                      h * 20 / 100, max(1, 3 * w / CENTER_SIZE), black);
-    spr.fillRoundRect(x + w * 18 / 100, y + h * 58 / 100, w * 24 / 100,
-                      h * 20 / 100, max(1, 3 * w / CENTER_SIZE), black);
-    break;
-  }
-}
-
-// Compute Cover Flow position for an album at given offset (fixed-point /100)
-// Stores width, height, cx, and returns depth tier (0=center, 1=side, 2=far,
-// 3=offscreen)
 static int getCoverFlowPos(int32_t offset_fp, int *out_w, int *out_h,
                            int *out_cx) {
   int32_t absOff = abs(offset_fp);
   int sign = (offset_fp < 0) ? -1 : ((offset_fp > 0) ? 1 : 0);
 
-  int height, width, cx_offset;
-
   if (absOff <= SCROLL_SCALE) {
-    // Center → side: height stays close, width squishes to simulate rotation
-    height = iLerp(CENTER_SIZE, SIDE_SIZE, absOff);
-    width =
-        iLerp(CENTER_SIZE, SIDE_SIZE * 55 / 100, absOff); // scaleX: 1.0 → 0.55
-    // Non-linear offset for natural spread
+    int height = iLerp(CENTER_SIZE, SIDE_SIZE, absOff);
+    int width = iLerp(CENTER_SIZE, SIDE_SIZE * 55 / 100, absOff);
     int32_t t_curve = absOff * 85 / 100;
-    cx_offset = sign * iLerp(0, SIDE_OFFSET, t_curve > 100 ? 100 : t_curve);
+    int cx_offset = sign * iLerp(0, SIDE_OFFSET, t_curve > 100 ? 100 : t_curve);
     *out_w = width;
     *out_h = height;
     *out_cx = SCREEN_W / 2 + cx_offset;
     return (absOff < 30) ? 0 : 1;
   } else if (absOff <= 2 * SCROLL_SCALE) {
     int32_t t = absOff - SCROLL_SCALE;
-    height = iLerp(SIDE_SIZE, FAR_SIZE, t);
-    width = iLerp(SIDE_SIZE * 55 / 100, FAR_SIZE * 40 / 100,
-                  t); // scaleX: 0.55 → 0.40
-    cx_offset = sign * iLerp(SIDE_OFFSET, FAR_OFFSET, t);
+    int height = iLerp(SIDE_SIZE, FAR_SIZE, t);
+    int width = iLerp(SIDE_SIZE * 55 / 100, FAR_SIZE * 40 / 100, t);
+    int cx_offset = sign * iLerp(SIDE_OFFSET, FAR_OFFSET, t);
     *out_w = width;
     *out_h = height;
     *out_cx = SCREEN_W / 2 + cx_offset;
@@ -188,32 +329,48 @@ static int getCoverFlowPos(int32_t offset_fp, int *out_w, int *out_h,
   return 3;
 }
 
+// ============================================================
+// Drawing
+// ============================================================
+
 static void draw_ui() {
-  if (!sprite_created) {
-    spr.setColorDepth(16);
-    if (spr.createSprite(SCREEN_W, SPRITE_H) == nullptr) {
-      Serial.println("SPRITE ALLOCATION FAILED");
-      return;
+  if (album_count == 0) {
+    // Show error message instead of blank screen
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("No albums found", SCREEN_W / 2, SCREEN_H / 2 - 20, 2);
+    tft.setTextColor(tft.color565(160, 160, 160));
+    tft.setTextDatum(MC_DATUM);
+    if (!sd_ok) {
+      tft.drawString("SD card not detected", SCREEN_W / 2, SCREEN_H / 2 + 10,
+                     1);
+    } else {
+      tft.drawString("Copy metadata.csv to SD card", SCREEN_W / 2,
+                     SCREEN_H / 2 + 10, 1);
     }
-    sprite_created = true;
+    return;
   }
+
+  if (!sprite_created)
+    return; // Sprite created in ui_init
 
   spr.fillSprite(TFT_BLACK);
 
-  // Collect visible albums with transforms
+  // Collect visible albums
   struct AlbumDraw {
     int index, w, h, cx, depth;
     int32_t absOffset;
   };
-  AlbumDraw items[ALBUM_COUNT];
+  AlbumDraw items[7]; // Max visible: center + 2 sides + 2 far + margin
   int itemCount = 0;
 
-  for (int i = 0; i < ALBUM_COUNT; i++) {
+  for (int i = 0; i < album_count; i++) {
     int32_t offset_fp = (int32_t)i * SCROLL_SCALE - scroll_pos;
     int w, h, cx;
     int depth = getCoverFlowPos(offset_fp, &w, &h, &cx);
 
-    if (depth < 3 && w > 5) {
+    if (depth < 3 && w > 5 && itemCount < 7) {
       items[itemCount] = {i, w, h, cx, depth, abs(offset_fp)};
       itemCount++;
     }
@@ -230,7 +387,7 @@ static void draw_ui() {
     }
   }
 
-  // Draw into sprite
+  // Draw album art
   for (int n = 0; n < itemCount; n++) {
     int i = items[n].index;
     int w = items[n].w;
@@ -238,16 +395,8 @@ static void draw_ui() {
     int x = items[n].cx - w / 2;
     int y = (SPRITE_H - h) / 2;
 
-    uint16_t color;
-    if (items[n].depth == 0)
-      color = album_colors[i];
-    else if (items[n].depth == 1)
-      color = album_colors_dim[i];
-    else
-      color = album_colors_far[i];
-
     if (x + w > 0 && x < SCREEN_W) {
-      drawAlbumArt(x, y, w, h, color, i);
+      drawAlbumArt(x, y, w, h, i);
     }
   }
 
@@ -255,39 +404,87 @@ static void draw_ui() {
   int y_offset = (SCREEN_H - SPRITE_H) / 2;
   spr.pushSprite(0, y_offset);
 
-  // Album name (center only)
+  // Album title + artist text (center only)
   tft.fillRect(0, y_offset + SPRITE_H, SCREEN_W, 30, TFT_BLACK);
   int centerIndex = (scroll_pos + SCROLL_SCALE / 2) / SCROLL_SCALE;
-  centerIndex = constrain(centerIndex, 0, ALBUM_COUNT - 1);
+  centerIndex = constrain(centerIndex, 0, album_count - 1);
 
   int32_t snapDist = abs(scroll_pos - (int32_t)centerIndex * SCROLL_SCALE);
   if (snapDist < 35) {
     tft.setTextColor(TFT_WHITE);
     tft.setTextDatum(TC_DATUM);
-    tft.drawString(album_names[centerIndex], SCREEN_W / 2,
-                   y_offset + SPRITE_H + 6, 2);
+    tft.drawString(album_titles[centerIndex], SCREEN_W / 2,
+                   y_offset + SPRITE_H + 4, 2);
+    tft.setTextColor(tft.color565(160, 160, 160));
+    tft.drawString(album_artists[centerIndex], SCREEN_W / 2,
+                   y_offset + SPRITE_H + 20, 1);
   }
 
   // Clear top
   tft.fillRect(0, 0, SCREEN_W, y_offset, TFT_BLACK);
 }
 
+// ============================================================
+// Public API
+// ============================================================
+
 void ui_init() {
+  // CRITICAL: Create sprite FIRST — it's the largest allocation (89.6KB)
+  // and must succeed for any display to work
+  if (!sprite_created) {
+    spr.setColorDepth(16);
+    if (spr.createSprite(SCREEN_W, SPRITE_H) == nullptr) {
+      Serial.println("SPRITE ALLOCATION FAILED");
+    } else {
+      sprite_created = true;
+      Serial.println("Sprite created OK");
+    }
+  }
+
+  // Now allocate cache slots from remaining heap
+  Serial.print("Free heap: ");
+  Serial.println(ESP.getFreeHeap());
+  initCache();
+
+  loadAlbumsFromSD();
   scroll_pos = 0;
   target_scroll = 0;
   draw_ui();
 }
 
 void ui_update() {
+  if (album_count == 0)
+    return;
+
   static int32_t last_scroll_pos = -1;
   static unsigned long last_update_time = 0;
   int16_t tx, ty;
   bool touched = get_touch_coords(&tx, &ty);
 
+  // --- Rotary encoder input ---
+  extern int32_t get_encoder_delta();
+  int32_t enc = get_encoder_delta();
+  if (enc != 0 && !is_dragging) {
+    int current_album = constrain(
+        (target_scroll + SCROLL_SCALE / 2) / SCROLL_SCALE, 0, album_count - 1);
+    int next_album = constrain(current_album + enc, 0, album_count - 1);
+    target_scroll = (int32_t)next_album * SCROLL_SCALE;
+    Serial.print("ENC enc=");
+    Serial.print(enc);
+    Serial.print(" cur=");
+    Serial.print(current_album);
+    Serial.print(" next=");
+    Serial.print(next_album);
+    Serial.print(" tgt=");
+    Serial.print(target_scroll);
+    Serial.print(" pos=");
+    Serial.println(scroll_pos);
+  }
+
   unsigned long now = millis();
   unsigned long dt = now - last_update_time;
   if (dt > 100)
-    dt = 16; // Clamp after pauses
+    dt = 16;
   last_update_time = now;
 
   if (touched) {
@@ -302,14 +499,13 @@ void ui_update() {
       int16_t dx = tx - touch_start_x;
       scroll_pos = scroll_start - (int32_t)dx * SCROLL_SCALE / DRAG_SENSITIVITY;
 
-      // Smooth momentum: blend old and new velocity (50/50) to reduce spikes
       int32_t new_vel =
           ((int32_t)(last_tx - tx) * SCROLL_SCALE) / DRAG_SENSITIVITY;
       momentum_velocity = (momentum_velocity + new_vel) / 2;
       last_tx = tx;
 
       int32_t lo = -OVERSCROLL_LIMIT;
-      int32_t hi = (int32_t)(ALBUM_COUNT - 1) * SCROLL_SCALE + OVERSCROLL_LIMIT;
+      int32_t hi = (int32_t)(album_count - 1) * SCROLL_SCALE + OVERSCROLL_LIMIT;
       scroll_pos = constrain(scroll_pos, lo, hi);
       target_scroll = scroll_pos;
     }
@@ -322,31 +518,31 @@ void ui_update() {
       if (totalDrag < 6 && duration < 300) {
         // Tap — play center album
         int ci = constrain((scroll_pos + SCROLL_SCALE / 2) / SCROLL_SCALE, 0,
-                           ALBUM_COUNT - 1);
+                           album_count - 1);
         Serial.print("Tapped: ");
-        Serial.println(album_names[ci]);
-        spotify_play_album(album_uris[ci]);
+        Serial.println(album_titles[ci]);
+        if (album_uris[ci][0] != '\0') {
+          spotify_play_album(album_uris[ci]);
+        }
         target_scroll = (int32_t)ci * SCROLL_SCALE;
       } else {
-        // Flick with momentum
         target_scroll = scroll_pos + momentum_velocity * MOMENTUM_MULT / 10;
       }
 
       target_scroll = constrain(target_scroll, (int32_t)0,
-                                (int32_t)(ALBUM_COUNT - 1) * SCROLL_SCALE);
+                                (int32_t)(album_count - 1) * SCROLL_SCALE);
       int closest = constrain((target_scroll + SCROLL_SCALE / 2) / SCROLL_SCALE,
-                              0, ALBUM_COUNT - 1);
+                              0, album_count - 1);
       target_scroll = (int32_t)closest * SCROLL_SCALE;
     }
   }
 
-  // Delta-time exponential easing (frame-rate independent, smooth)
+  // Delta-time easing
   if (!is_dragging && scroll_pos != target_scroll) {
-    // lerp factor: ~15% per 16ms frame, scales with actual dt
     int32_t diff = target_scroll - scroll_pos;
     int32_t step = diff * (int32_t)dt / 100;
     if (step == 0)
-      step = (diff > 0) ? 1 : -1; // Always make progress
+      step = (diff > 0) ? 1 : -1;
     if (abs(diff) <= 2)
       scroll_pos = target_scroll;
     else
