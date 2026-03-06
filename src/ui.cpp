@@ -18,18 +18,15 @@ static int album_count = 0; // Actual number loaded from SD
 #define SCREEN_W 320
 #define SCREEN_H 240
 
-// Cover Flow layout — albums rotate away from center
-#define CENTER_SIZE 120
-#define SIDE_SIZE 100
-#define FAR_SIZE 80
-#define SIDE_OFFSET 95
-#define FAR_OFFSET 145
-#define SPRITE_H 140
-#define IMG_SRC_SIZE 120
+// Simple horizontal slide layout — all albums same size
+#define ALBUM_SIZE 80
+#define ALBUM_SPACING 100  // Center-to-center distance between albums
+#define SPRITE_H 100
+#define IMG_SRC_SIZE 80
 #define IMG_PIXELS (IMG_SRC_SIZE * IMG_SRC_SIZE)
 
 // --- Per-Album Metadata (loaded from SD metadata.csv) ---
-static char album_filenames[MAX_ALBUMS][64];
+static char album_filenames[MAX_ALBUMS][128];
 static char album_titles[MAX_ALBUMS][32];
 static char album_artists[MAX_ALBUMS][24];
 static char album_uris[MAX_ALBUMS][48];
@@ -46,8 +43,7 @@ static uint16_t fallback_color = 0x4208;
 static void initCache() {
   for (int s = 0; s < CACHE_SLOTS; s++) {
     if (!sd_img_cache[s]) {
-      // Check if enough heap remains (need 28.8KB + margin)
-      if (ESP.getFreeHeap() < 40000) {
+      if (ESP.getFreeHeap() < 20000) {
         Serial.print("Not enough heap for cache slot ");
         Serial.println(s);
         break;
@@ -67,15 +63,33 @@ static void initCache() {
 }
 
 // --- Scroll State (fixed-point, x100) ---
+// ============================================================
+// TUNING — Change these values to adjust feel
+// ============================================================
+
+// --- Encoder tuning ---
+// Easing speed when scrolling via encoder.
+// Lower = faster snap. 5 = near-instant, 12 = smooth, 20 = slow.
+#define ENCODER_EASE_SPEED 5
+// Min step per frame for encoder (prevents slow crawl at end).
+#define ENCODER_MIN_STEP 8
+
+// --- Touch tuning ---
+// Easing speed when snapping after touch release.
+// Lower = faster snap. 5 = near-instant, 12 = smooth, 20 = slow.
+#define TOUCH_EASE_SPEED 10
+// Min step per frame for touch snap.
+#define TOUCH_MIN_STEP 5
+// How many pixels of finger movement = 1 album scroll.
+// Lower = more sensitive. 30 = very fast, 50 = moderate, 100 = slow.
+#define TOUCH_DRAG_DIVISOR 40
+// How far you can scroll past the first/last album.
+#define OVERSCROLL_LIMIT 30
+
+// --- Scroll State (fixed-point, x100) ---
 static int32_t scroll_pos = 0;
 static int32_t target_scroll = 0;
 #define SCROLL_SCALE 100
-
-// --- Fluid Scroll Tuning ---
-#define DRAG_SENSITIVITY 180
-#define MOMENTUM_MULT 35
-#define EASE_DIVISOR 6
-#define OVERSCROLL_LIMIT 30
 
 // --- Touch State ---
 static bool is_dragging = false;
@@ -83,7 +97,7 @@ static int16_t touch_start_x = 0;
 static int32_t scroll_start = 0;
 static unsigned long touch_start_time = 0;
 static int32_t momentum_velocity = 0;
-static int16_t last_tx = 0;
+static bool ease_from_encoder = false;  // Which input triggered current easing
 
 // ============================================================
 // SD Card Album Loading
@@ -148,12 +162,12 @@ static void loadAlbumsFromSD() {
     return;
   }
 
-  char lineBuf[256];
+  char lineBuf[512];
   album_count = 0;
 
   while (f.available() && album_count < MAX_ALBUMS) {
     int len = 0;
-    while (f.available() && len < 255) {
+    while (f.available() && len < 511) {
       char c = f.read();
       if (c == '\n')
         break;
@@ -170,8 +184,8 @@ static void loadAlbumsFromSD() {
       continue;
 
     int i = album_count;
-    strncpy(album_filenames[i], fields[0], 63);
-    album_filenames[i][63] = '\0';
+    strncpy(album_filenames[i], fields[0], 127);
+    album_filenames[i][127] = '\0';
     strncpy(album_titles[i], fields[1], 31);
     album_titles[i][31] = '\0';
     strncpy(album_artists[i], fields[2], 23);
@@ -219,18 +233,17 @@ static int loadAlbumImage(int index) {
     }
   }
 
-  // Find LRU slot — only consider slots that were successfully allocated
+  // Find LRU slot
   int lru = -1;
   for (int s = 0; s < CACHE_SLOTS; s++) {
     if (!sd_img_cache[s])
-      continue; // Skip failed slots
+      continue;
     if (lru == -1 || cache_access_time[s] < cache_access_time[lru])
       lru = s;
   }
   if (lru == -1)
-    return -1; // No usable cache slots
+    return -1;
 
-  // Read from SD
   char path[128];
   snprintf(path, sizeof(path), "/sd_card_albums/%s", album_filenames[index]);
 
@@ -244,7 +257,6 @@ static int loadAlbumImage(int index) {
   if (bytesRead != (size_t)(IMG_PIXELS * 2))
     return -1;
 
-  // Byte-swap: .bin files are big-endian, ESP32 is little-endian
   for (int i = 0; i < IMG_PIXELS; i++) {
     uint16_t v = sd_img_cache[lru][i];
     sd_img_cache[lru][i] = (v >> 8) | (v << 8);
@@ -255,78 +267,15 @@ static int loadAlbumImage(int index) {
   return lru;
 }
 
-static void drawScaledImage(const uint16_t *src, int srcW, int srcH, int dx,
-                            int dy, int dstW, int dstH) {
-  if (dstW == srcW && dstH == srcH) {
-    // Fast path: no scaling, use pushImage with byte swap for SPI
-    spr.setSwapBytes(true);
-    spr.pushImage(dx, dy, srcW, srcH, src);
-    spr.setSwapBytes(false);
-  } else {
-    // Nearest-neighbor downscale via drawPixel (no swap needed)
-    for (int y = 0; y < dstH; y++) {
-      int srcY = y * srcH / dstH;
-      for (int x = 0; x < dstW; x++) {
-        int srcX = x * srcW / dstW;
-        spr.drawPixel(dx + x, dy + y, src[srcY * srcW + srcX]);
-      }
-    }
-  }
-}
-
-static void drawAlbumArt(int x, int y, int w, int h, int index) {
-  if (w < 6 || h < 6)
-    return;
-
+static void drawAlbumArt(int x, int y, int index) {
   int slot = loadAlbumImage(index);
   if (slot >= 0) {
-    drawScaledImage(sd_img_cache[slot], IMG_SRC_SIZE, IMG_SRC_SIZE, x, y, w, h);
+    spr.setSwapBytes(true);
+    spr.pushImage(x, y, ALBUM_SIZE, ALBUM_SIZE, sd_img_cache[slot]);
+    spr.setSwapBytes(false);
   } else {
-    spr.fillRoundRect(x, y, w, h, 4, fallback_color);
+    spr.fillRoundRect(x, y, ALBUM_SIZE, ALBUM_SIZE, 4, fallback_color);
   }
-}
-
-// ============================================================
-// Cover Flow Layout
-// ============================================================
-
-static int32_t iLerp(int32_t a, int32_t b, int32_t t) {
-  if (t <= 0)
-    return a;
-  if (t >= 100)
-    return b;
-  return a + ((b - a) * t) / 100;
-}
-
-static int getCoverFlowPos(int32_t offset_fp, int *out_w, int *out_h,
-                           int *out_cx) {
-  int32_t absOff = abs(offset_fp);
-  int sign = (offset_fp < 0) ? -1 : ((offset_fp > 0) ? 1 : 0);
-
-  if (absOff <= SCROLL_SCALE) {
-    int height = iLerp(CENTER_SIZE, SIDE_SIZE, absOff);
-    int width = iLerp(CENTER_SIZE, SIDE_SIZE * 55 / 100, absOff);
-    int32_t t_curve = absOff * 85 / 100;
-    int cx_offset = sign * iLerp(0, SIDE_OFFSET, t_curve > 100 ? 100 : t_curve);
-    *out_w = width;
-    *out_h = height;
-    *out_cx = SCREEN_W / 2 + cx_offset;
-    return (absOff < 30) ? 0 : 1;
-  } else if (absOff <= 2 * SCROLL_SCALE) {
-    int32_t t = absOff - SCROLL_SCALE;
-    int height = iLerp(SIDE_SIZE, FAR_SIZE, t);
-    int width = iLerp(SIDE_SIZE * 55 / 100, FAR_SIZE * 40 / 100, t);
-    int cx_offset = sign * iLerp(SIDE_OFFSET, FAR_OFFSET, t);
-    *out_w = width;
-    *out_h = height;
-    *out_cx = SCREEN_W / 2 + cx_offset;
-    return 2;
-  }
-
-  *out_w = 0;
-  *out_h = 0;
-  *out_cx = 0;
-  return 3;
 }
 
 // ============================================================
@@ -357,47 +306,21 @@ static void draw_ui() {
 
   spr.fillSprite(TFT_BLACK);
 
-  // Collect visible albums
-  struct AlbumDraw {
-    int index, w, h, cx, depth;
-    int32_t absOffset;
-  };
-  AlbumDraw items[7]; // Max visible: center + 2 sides + 2 far + margin
-  int itemCount = 0;
+  // Simple horizontal slide: calculate pixel offset from scroll position
+  // scroll_pos is in fixed-point (x100), so album i is at pixel center:
+  //   cx = SCREEN_W/2 + (i * ALBUM_SPACING) - scroll_pos * ALBUM_SPACING / SCROLL_SCALE
+  int32_t scroll_px = scroll_pos * ALBUM_SPACING / SCROLL_SCALE;
+  int album_y = (SPRITE_H - ALBUM_SIZE) / 2;
 
   for (int i = 0; i < album_count; i++) {
-    int32_t offset_fp = (int32_t)i * SCROLL_SCALE - scroll_pos;
-    int w, h, cx;
-    int depth = getCoverFlowPos(offset_fp, &w, &h, &cx);
+    int cx = SCREEN_W / 2 + i * ALBUM_SPACING - scroll_px;
+    int ax = cx - ALBUM_SIZE / 2;
 
-    if (depth < 3 && w > 5 && itemCount < 7) {
-      items[itemCount] = {i, w, h, cx, depth, abs(offset_fp)};
-      itemCount++;
-    }
-  }
+    // Skip if off-screen
+    if (ax + ALBUM_SIZE < 0 || ax >= SCREEN_W)
+      continue;
 
-  // Sort: draw far albums first (painter's algorithm)
-  for (int i = 0; i < itemCount - 1; i++) {
-    for (int j = 0; j < itemCount - 1 - i; j++) {
-      if (items[j].absOffset < items[j + 1].absOffset) {
-        AlbumDraw tmp = items[j];
-        items[j] = items[j + 1];
-        items[j + 1] = tmp;
-      }
-    }
-  }
-
-  // Draw album art
-  for (int n = 0; n < itemCount; n++) {
-    int i = items[n].index;
-    int w = items[n].w;
-    int h = items[n].h;
-    int x = items[n].cx - w / 2;
-    int y = (SPRITE_H - h) / 2;
-
-    if (x + w > 0 && x < SCREEN_W) {
-      drawAlbumArt(x, y, w, h, i);
-    }
+    drawAlbumArt(ax, album_y, i);
   }
 
   // Push sprite
@@ -458,61 +381,54 @@ void ui_update() {
 
   static int32_t last_scroll_pos = -1;
   static unsigned long last_update_time = 0;
+  unsigned long now = millis();
+  unsigned long dt = now - last_update_time;
+  if (dt > 100) dt = 16;
+  if (dt > 0) last_update_time = now;
+
   int16_t tx, ty;
   bool touched = get_touch_coords(&tx, &ty);
 
-  // --- Rotary encoder input ---
+  // --- Rotary encoder: sets target, cancels touch ---
   extern int32_t get_encoder_delta();
-  int32_t enc = get_encoder_delta();
-  if (enc != 0 && !is_dragging) {
+  int32_t enc = -get_encoder_delta();
+  if (enc > 1) enc = 1;
+  if (enc < -1) enc = -1;
+  bool encoder_active = false;
+  if (enc != 0) {
+    encoder_active = true;
+    is_dragging = false;
+    momentum_velocity = 0;
+
     int current_album = constrain(
         (target_scroll + SCROLL_SCALE / 2) / SCROLL_SCALE, 0, album_count - 1);
     int next_album = constrain(current_album + enc, 0, album_count - 1);
     target_scroll = (int32_t)next_album * SCROLL_SCALE;
-    Serial.print("ENC enc=");
-    Serial.print(enc);
-    Serial.print(" cur=");
-    Serial.print(current_album);
-    Serial.print(" next=");
-    Serial.print(next_album);
-    Serial.print(" tgt=");
-    Serial.print(target_scroll);
-    Serial.print(" pos=");
-    Serial.println(scroll_pos);
+    ease_from_encoder = true;
   }
 
-  unsigned long now = millis();
-  unsigned long dt = now - last_update_time;
-  if (dt > 100)
-    dt = 16;
-  last_update_time = now;
+  // --- Touch input (only if encoder didn't fire this frame) ---
+  if (!encoder_active) {
+    if (touched) {
+      if (!is_dragging) {
+        is_dragging = true;
+        touch_start_x = tx;
+        scroll_start = scroll_pos;
+        touch_start_time = now;
+        momentum_velocity = 0;
+      } else {
+        int16_t dx = tx - touch_start_x;
+        scroll_pos = scroll_start - (int32_t)dx * SCROLL_SCALE / TOUCH_DRAG_DIVISOR;
 
-  if (touched) {
-    if (!is_dragging) {
-      is_dragging = true;
-      touch_start_x = tx;
-      last_tx = tx;
-      scroll_start = scroll_pos;
-      touch_start_time = millis();
-      momentum_velocity = 0;
-    } else {
-      int16_t dx = tx - touch_start_x;
-      scroll_pos = scroll_start - (int32_t)dx * SCROLL_SCALE / DRAG_SENSITIVITY;
-
-      int32_t new_vel =
-          ((int32_t)(last_tx - tx) * SCROLL_SCALE) / DRAG_SENSITIVITY;
-      momentum_velocity = (momentum_velocity + new_vel) / 2;
-      last_tx = tx;
-
-      int32_t lo = -OVERSCROLL_LIMIT;
-      int32_t hi = (int32_t)(album_count - 1) * SCROLL_SCALE + OVERSCROLL_LIMIT;
-      scroll_pos = constrain(scroll_pos, lo, hi);
-      target_scroll = scroll_pos;
-    }
-  } else {
-    if (is_dragging) {
+        int32_t lo = -OVERSCROLL_LIMIT;
+        int32_t hi = (int32_t)(album_count - 1) * SCROLL_SCALE + OVERSCROLL_LIMIT;
+        scroll_pos = constrain(scroll_pos, lo, hi);
+        target_scroll = scroll_pos;
+      }
+    } else if (is_dragging) {
+      // Touch released — snap to nearest album (no momentum fling)
       is_dragging = false;
-      unsigned long duration = millis() - touch_start_time;
+      unsigned long duration = now - touch_start_time;
       int32_t totalDrag = abs(scroll_pos - scroll_start);
 
       if (totalDrag < 6 && duration < 300) {
@@ -524,39 +440,39 @@ void ui_update() {
         if (album_uris[ci][0] != '\0') {
           spotify_play_album(album_uris[ci]);
         }
-        target_scroll = (int32_t)ci * SCROLL_SCALE;
-      } else {
-        target_scroll = scroll_pos + momentum_velocity * MOMENTUM_MULT / 10;
       }
 
-      target_scroll = constrain(target_scroll, (int32_t)0,
-                                (int32_t)(album_count - 1) * SCROLL_SCALE);
-      int closest = constrain((target_scroll + SCROLL_SCALE / 2) / SCROLL_SCALE,
+      // Snap to nearest album
+      int closest = constrain((scroll_pos + SCROLL_SCALE / 2) / SCROLL_SCALE,
                               0, album_count - 1);
       target_scroll = (int32_t)closest * SCROLL_SCALE;
+      ease_from_encoder = false;
     }
   }
 
-  // Delta-time easing
-  if (!is_dragging && scroll_pos != target_scroll) {
+  // --- Easing toward target (uses encoder or touch speed) ---
+  if (dt > 0 && !is_dragging && scroll_pos != target_scroll) {
+    int32_t ease_spd = ease_from_encoder ? ENCODER_EASE_SPEED : TOUCH_EASE_SPEED;
+    int32_t min_stp = ease_from_encoder ? ENCODER_MIN_STEP : TOUCH_MIN_STEP;
     int32_t diff = target_scroll - scroll_pos;
-    int32_t step = diff * (int32_t)dt / 100;
-    if (step == 0)
-      step = (diff > 0) ? 1 : -1;
-    if (abs(diff) <= 2)
+    int32_t step = diff * (int32_t)dt / ease_spd;
+    if (step == 0 || (abs(step) < min_stp && abs(diff) > 1))
+      step = (diff > 0) ? min_stp : -min_stp;
+
+    if (abs(diff) <= abs(step))
       scroll_pos = target_scroll;
     else
       scroll_pos += step;
   }
 
-  // ~60fps cap
+  // --- Draw at ~60fps ---
   static unsigned long last_frame = 0;
-  if (millis() - last_frame >= 16) {
+  if (now - last_frame >= 16) {
     if (scroll_pos != last_scroll_pos) {
       draw_ui();
       last_scroll_pos = scroll_pos;
-      last_frame = millis();
     }
+    last_frame = now;
   }
 }
 

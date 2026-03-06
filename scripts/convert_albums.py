@@ -25,7 +25,7 @@ except ImportError:
     print("Error: Pillow library is required. Install it using: pip install Pillow")
     sys.exit(1)
 
-TARGET_SIZE = (120, 120)
+TARGET_SIZE = (80, 80)
 
 # Manual metadata overrides: filename_stem -> (title, artist, spotify_uri)
 # Add entries here for non-standard filenames or to set Spotify URIs
@@ -78,9 +78,9 @@ def guess_metadata(filename_stem):
     return (filename_stem.replace('_', ' '), "Unknown", "")
 
 
-def convert_to_rgb565(input_path, output_path):
+def convert_to_rgb565(input_path, output_path, size):
     img = Image.open(input_path).convert('RGB')
-    img = img.resize(TARGET_SIZE, Image.Resampling.LANCZOS)
+    img = img.resize(size, Image.Resampling.LANCZOS)
     pixels = img.load()
     width, height = img.size
 
@@ -108,7 +108,7 @@ def process_directory(input_dir, output_dir):
             output_path = os.path.join(output_dir, bin_filename)
 
             print(f"  Converting: {filename} -> {bin_filename}")
-            convert_to_rgb565(input_path, output_path)
+            convert_to_rgb565(input_path, output_path, TARGET_SIZE)
 
             title, artist, uri = guess_metadata(stem)
             albums.append((bin_filename, title, artist, uri))

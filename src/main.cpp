@@ -29,16 +29,23 @@ static int lastCLK = HIGH;
 
 // Call every loop iteration to poll encoder
 static int32_t enc_lifetime = 0; // Never reset — for debugging
+static unsigned long last_enc_time = 0;
+#define ENCODER_DEBOUNCE_US 2000 // 2ms debounce
+
 void encoder_poll() {
   int curCLK = digitalRead(ENCODER_CLK);
   if (lastCLK == HIGH && curCLK == LOW) {
-    // CLK falling edge: check DT to determine direction
-    if (digitalRead(ENCODER_DT)) {
-      encoder_count++;
-      enc_lifetime++;
-    } else {
-      encoder_count--;
-      enc_lifetime--;
+    unsigned long now_us = micros();
+    if (now_us - last_enc_time > ENCODER_DEBOUNCE_US) {
+      // CLK falling edge: check DT to determine direction
+      if (digitalRead(ENCODER_DT)) {
+        encoder_count++;
+        enc_lifetime++;
+      } else {
+        encoder_count--;
+        enc_lifetime--;
+      }
+      last_enc_time = now_us;
     }
   }
   lastCLK = curCLK;
@@ -58,47 +65,52 @@ int32_t get_encoder_delta() {
 #define XPT2046_CLK 25
 #define XPT2046_CS 33
 
-SPIClass touchSpi = SPIClass(VSPI);
+SPIClass touchSpi = SPIClass(HSPI);
 XPT2046_Touchscreen touch(XPT2046_CS, XPT2046_IRQ);
 
 static int16_t smooth_x = -1, smooth_y = -1;
+int16_t touch_pressure = 0;  // For debug display
 
 bool get_touch_coords(int16_t *x, int16_t *y) {
-  if (touch.touched()) {
-    TS_Point p = touch.getPoint();
-    // CYD Portrait Touch Calibration
-    int16_t raw_x = map(p.x, 200, 3700, 0, 320);
-    int16_t raw_y = map(p.y, 240, 3800, 0, 240);
-
-    // IIR low-pass filter to smooth noisy XPT2046 readings
-    if (smooth_x < 0) {
-      smooth_x = raw_x;
-      smooth_y = raw_y;
-    } else {
-      smooth_x = (smooth_x * 3 + raw_x) / 4; // 75% old, 25% new
-      smooth_y = (smooth_y * 3 + raw_y) / 4;
-    }
-
-    *x = smooth_x;
-    *y = smooth_y;
-    return true;
+  if (!touch.tirqTouched() || !touch.touched()) {
+    smooth_x = -1;
+    smooth_y = -1;
+    return false;
   }
-  // Reset filter when finger lifts so next touch starts fresh
-  smooth_x = -1;
-  smooth_y = -1;
-  return false;
+
+  TS_Point p = touch.getPoint();
+  touch_pressure = p.z;
+
+  // Map raw XPT2046 coordinates to screen pixels
+  int16_t mapped_x = map(p.x, 200, 3800, 0, 319);
+  int16_t mapped_y = map(p.y, 200, 3800, 0, 239);
+  mapped_x = constrain(mapped_x, 0, 319);
+  mapped_y = constrain(mapped_y, 0, 239);
+
+  // Exponential smoothing to reduce jitter
+  if (smooth_x < 0) {
+    smooth_x = mapped_x;
+    smooth_y = mapped_y;
+  } else {
+    smooth_x = (smooth_x * 3 + mapped_x) / 4;
+    smooth_y = (smooth_y * 3 + mapped_y) / 4;
+  }
+
+  *x = smooth_x;
+  *y = smooth_y;
+  return true;
 }
 
 void setup() {
   Serial.begin(115200);
 
   tft.begin();
-  tft.setRotation(1);
+  tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
 
   touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   touch.begin(touchSpi);
-  touch.setRotation(1);
+  touch.setRotation(3);
 
   // SD card on default VSPI, CS = GPIO 5
   if (SD.begin(5)) {
