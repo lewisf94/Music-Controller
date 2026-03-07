@@ -69,7 +69,7 @@ SPIClass touchSpi = SPIClass(HSPI);
 XPT2046_Touchscreen touch(XPT2046_CS, XPT2046_IRQ);
 
 static int16_t smooth_x = -1, smooth_y = -1;
-int16_t touch_pressure = 0;  // For debug display
+int16_t touch_pressure = 0; // For debug display
 
 bool get_touch_coords(int16_t *x, int16_t *y) {
   if (!touch.tirqTouched() || !touch.touched()) {

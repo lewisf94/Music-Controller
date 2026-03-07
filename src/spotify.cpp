@@ -4,6 +4,7 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include "mbedtls/base64.h"
+#include <SD.h>
 
 static const char* wifi_ssid;
 static const char* wifi_password;
@@ -13,6 +14,60 @@ static const char* refresh_token;
 
 static String access_token = "";
 static unsigned long token_expiry = 0;
+
+SpotifyTrackInfo current_track_info = {false, "", "", "", 0, 0, ""};
+bool track_info_updated = false;
+
+static void download_album_art(const char* url) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    WiFiClientSecure *client = new WiFiClientSecure;
+    client->setInsecure();
+    HTTPClient https;
+    if (https.begin(*client, url)) {
+        int httpCode = https.GET();
+        if (httpCode == HTTP_CODE_OK) {
+            File f = SD.open("/sd_card_albums/nowplaying.jpg", FILE_WRITE);
+            if (f) {
+                https.writeToStream(&f);
+                f.close();
+                Serial.println("Album art downloaded to /sd_card_albums/nowplaying.jpg");
+            } else {
+                Serial.println("Failed to open /sd_card_albums/nowplaying.jpg for writing");
+            }
+        }
+    }
+    https.end();
+    delete client;
+}
+
+void copy_album_art(const char* src_filename) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sd_card_albums/%s", src_filename);
+    
+    File src = SD.open(path, FILE_READ);
+    if (!src) {
+        Serial.println("Failed to open source image for copy");
+        return;
+    }
+    
+    File dst = SD.open("/sd_card_albums/nowplaying.jpg", FILE_WRITE);
+    if (!dst) {
+        Serial.println("Failed to open destination image for copy");
+        src.close();
+        return;
+    }
+    
+    // Copy data
+    uint8_t buf[512];
+    while (src.available()) {
+        int len = src.read(buf, 512);
+        dst.write(buf, len);
+    }
+    
+    src.close();
+    dst.close();
+    Serial.println("Copied album art for local simulation");
+}
 
 // DigiCert Global Root G2 (used by accounts.spotify.com and api.spotify.com)
 static const char* const spotify_ca =
@@ -89,6 +144,14 @@ void spotify_update() {
     if (access_token == "" || millis() > token_expiry) {
         refresh_access_token();
     }
+
+    static unsigned long last_fetch = 0;
+    // Fetch currently playing every 2 seconds when we have a token
+    if (access_token != "" && millis() - last_fetch > 2000) {
+        last_fetch = millis();
+        // Since network calls block the UI, we only do this periodically
+        spotify_fetch_currently_playing();
+    }
 }
 
 bool spotify_play_album(const char* album_uri) {
@@ -118,4 +181,57 @@ bool spotify_play_album(const char* album_uri) {
     }
     delete client;
     return false;
+}
+
+void spotify_fetch_currently_playing() {
+    if (access_token == "" || WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClientSecure *client = new WiFiClientSecure;
+    client->setInsecure();
+
+    HTTPClient https;
+    if (https.begin(*client, "https://api.spotify.com/v1/me/player/currently-playing")) {
+        https.addHeader("Authorization", "Bearer " + access_token);
+        int httpCode = https.GET();
+        
+        if (httpCode == HTTP_CODE_OK) {
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, https.getStream());
+            if (!error && doc["item"]) {
+                current_track_info.is_playing = doc["is_playing"].as<bool>();
+                
+                const char* new_title = doc["item"]["name"] | "Unknown Track";
+                const char* new_artist = doc["item"]["artists"][0]["name"] | "Unknown Artist";
+                const char* new_album = doc["item"]["album"]["name"] | "Unknown Album";
+                const char* new_url = doc["item"]["album"]["images"][0]["url"] | "";
+                
+                current_track_info.progress_ms = doc["progress_ms"].as<uint32_t>();
+                current_track_info.duration_ms = doc["item"]["duration_ms"].as<uint32_t>();
+                
+                bool song_changed = strncmp(current_track_info.title, new_title, 63) != 0;
+                
+                strncpy(current_track_info.title, new_title, 63);
+                current_track_info.title[63] = '\0';
+                strncpy(current_track_info.artist, new_artist, 63);
+                current_track_info.artist[63] = '\0';
+                strncpy(current_track_info.album, new_album, 63);
+                current_track_info.album[63] = '\0';
+                
+                if (song_changed || strncmp(current_track_info.album_art_url, new_url, 127) != 0) {
+                    strncpy(current_track_info.album_art_url, new_url, 127);
+                    current_track_info.album_art_url[127] = '\0';
+                    if (new_url[0] != '\0') {
+                        download_album_art(new_url);
+                    }
+                }
+                track_info_updated = true;
+            }
+        } else if (httpCode == 204) {
+            current_track_info.is_playing = false;
+        } else {
+            Serial.printf("Currently Playing Error: %d\n", httpCode);
+        }
+    }
+    https.end();
+    delete client;
 }
