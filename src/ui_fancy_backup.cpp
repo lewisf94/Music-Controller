@@ -4,15 +4,14 @@
 #include <JPEGDEC.h>
 #include <SD.h>
 #include <TFT_eSPI.h>
-#include <XPT2046_Touchscreen.h>
 
 
 extern TFT_eSPI tft;
 extern bool get_touch_coords(int16_t *x, int16_t *y);
 
-// Main display and touch objects
-extern TFT_eSPI tft;
-extern XPT2046_Touchscreen ts;
+// Sprite for double buffering
+TFT_eSprite spr = TFT_eSprite(&tft);
+static bool sprite_created = false;
 
 // View state
 enum ViewMode { VIEW_BROWSER, VIEW_NOW_PLAYING };
@@ -339,7 +338,7 @@ static void drawAlbumArt(int x, int y, int index) {
     uint16_t *img = sd_img_cache[slot];
     uint16_t line_buf[ALBUM_SIZE];
 
-    tft.setSwapBytes(true);
+    spr.setSwapBytes(true);
     // 1.5x scaling: Map destination (0-119) to source (0-79)
     for (int dst_y = 0; dst_y < ALBUM_SIZE; dst_y++) {
       int src_y = (dst_y * 2) / 3;
@@ -349,11 +348,11 @@ static void drawAlbumArt(int x, int y, int index) {
         int src_x = (dst_x * 2) / 3;
         line_buf[dst_x] = img[src_idx + src_x];
       }
-      tft.pushImage(x, y + dst_y, ALBUM_SIZE, 1, line_buf);
+      spr.pushImage(x, y + dst_y, ALBUM_SIZE, 1, line_buf);
     }
-    tft.setSwapBytes(false);
+    spr.setSwapBytes(false);
   } else {
-    tft.fillRoundRect(x, y, ALBUM_SIZE, ALBUM_SIZE, 4, fallback_color);
+    spr.fillRoundRect(x, y, ALBUM_SIZE, ALBUM_SIZE, 4, fallback_color);
   }
 }
 
@@ -380,22 +379,17 @@ static void draw_album_browser() {
     return;
   }
 
+  if (!sprite_created)
+    return; // Sprite created in ui_init
+
+  spr.fillSprite(TFT_BLACK);
+
+  // Simple horizontal slide: calculate pixel offset from scroll position
+  // scroll_pos is in fixed-point (x100), so album i is at pixel center:
+  //   cx = SCREEN_W/2 + (i * ALBUM_SPACING) - scroll_pos * ALBUM_SPACING /
+  //   SCROLL_SCALE
   int32_t scroll_px = scroll_pos * ALBUM_SPACING / SCROLL_SCALE;
-  int y_offset = (SCREEN_H - SPRITE_H) / 2 - 15;
-  int album_y = y_offset + (SPRITE_H - ALBUM_SIZE) / 2;
-
-  // Optimize: Avoid redrawing if nothing has changed
-  static int32_t last_drawn_scroll = -999;
-  static ViewMode last_drawn_view = (ViewMode)-1;
-
-  if (last_drawn_scroll == scroll_pos && last_drawn_view == current_view) {
-    return;
-  }
-
-  // Clear background area for albums
-  tft.fillRect(0, y_offset, SCREEN_W, SPRITE_H, TFT_BLACK);
-  last_drawn_scroll = scroll_pos;
-  last_drawn_view = current_view;
+  int album_y = (SPRITE_H - ALBUM_SIZE) / 2;
 
   for (int i = 0; i < album_count; i++) {
     int cx = SCREEN_W / 2 + i * ALBUM_SPACING - scroll_px;
@@ -407,6 +401,10 @@ static void draw_album_browser() {
 
     drawAlbumArt(ax, album_y, i);
   }
+
+  // Push sprite shifted slightly higher to balance screen
+  int y_offset = (SCREEN_H - SPRITE_H) / 2 - 15;
+  spr.pushSprite(0, y_offset);
 
   // Album title + artist text (center only)
   tft.fillRect(0, y_offset + SPRITE_H, SCREEN_W, 30, TFT_BLACK);
@@ -497,7 +495,7 @@ static float fcos(float angle) { return cos(angle); }
 static bool np_show_square_art = false;
 static float current_rotation_angle = 0.0f;
 
-static void drawLocalAlbumArt(int center_x, int center_y, int index) {
+static void drawLocalAlbumArt(int center_x, int center_y, int index, bool to_sprite = false, int sprite_y_offset = 0) {
   int slot = loadAlbumImage(index);
   if (slot < 0) {
     // Fallback drawing if local cache fails
@@ -568,18 +566,24 @@ static void drawLocalAlbumArt(int center_x, int center_y, int index) {
           int real_src_x = (idx_x * IMG_SRC_SIZE) / TARGET_SIZE;
           int real_src_y = (idx_y * IMG_SRC_SIZE) / TARGET_SIZE;
 
-          tft.drawPixel(img_x + dx, img_y + dy,
-                        img[real_src_y * IMG_SRC_SIZE + real_src_x]);
+          if (to_sprite) {
+            spr.drawPixel(img_x + dx, img_y + dy - sprite_y_offset,
+                          img[real_src_y * IMG_SRC_SIZE + real_src_x]);
+          } else {
+            tft.drawPixel(img_x + dx, img_y + dy,
+                          img[real_src_y * IMG_SRC_SIZE + real_src_x]);
+          }
         } else if (dist_sq < inner_sq) {
           // Force the inner hole to black
-          tft.drawPixel(img_x + dx, img_y + dy, TFT_BLACK);
+          if (to_sprite) spr.drawPixel(img_x + dx, img_y + dy - sprite_y_offset, TFT_BLACK);
+          else tft.drawPixel(img_x + dx, img_y + dy, TFT_BLACK);
         }
       }
     }
   }
 }
 
-static void draw_tonearm() {
+static void draw_tonearm(bool to_sprite = false, int sprite_y_offset = 0) {
   if (np_show_square_art || current_track_info.duration_ms == 0)
     return;
 
@@ -602,26 +606,41 @@ static void draw_tonearm() {
   int needle_y = NP_TONEARM_PIVOT_Y + NP_TONEARM_LENGTH * sin(angle_rad);
 
   int p_x = NP_TONEARM_PIVOT_X;
-  int p_y = NP_TONEARM_PIVOT_Y;
+  int p_y = NP_TONEARM_PIVOT_Y - sprite_y_offset;
   int n_x = needle_x;
-  int n_y = needle_y;
+  int n_y = needle_y - sprite_y_offset;
 
-  // Partially clear the area where the tonearm sweeps that is OUTSIDE the vinyl
-  tft.fillRect(160 + NP_VINYL_OUTER_RADIUS, NP_TONEARM_PIVOT_Y + 12, 100, 100, TFT_BLACK);
+  if (!to_sprite) {
+    // Partially clear the area where the tonearm sweeps that is OUTSIDE the vinyl
+    tft.fillRect(160 + NP_VINYL_OUTER_RADIUS, NP_TONEARM_PIVOT_Y + 12, 100, 100, TFT_BLACK);
+  }
 
   // Draw thick Tonearm rod dynamically based on thickness
   uint16_t arm_color = NP_TONEARM_COLOR;
   
-  for (int t = -(NP_TONEARM_THICKNESS / 2); t <= (NP_TONEARM_THICKNESS / 2); t++) {
-      tft.drawLine(p_x + t, p_y, n_x + t, n_y, arm_color);
-      tft.drawLine(p_x, p_y + t, n_x, n_y + t, arm_color);
+  if (to_sprite) {
+      for (int t = -(NP_TONEARM_THICKNESS / 2); t <= (NP_TONEARM_THICKNESS / 2); t++) {
+          spr.drawLine(p_x + t, p_y, n_x + t, n_y, arm_color);
+          spr.drawLine(p_x, p_y + t, n_x, n_y + t, arm_color);
+      }
+      spr.fillCircle(p_x, p_y, 11 + (NP_TONEARM_THICKNESS / 2), NP_TONEARM_BASE_COLOR);
+      spr.fillCircle(p_x, p_y, 6 + (NP_TONEARM_THICKNESS / 2), arm_color);
+      spr.fillCircle(p_x, p_y, 3, NP_TONEARM_BASE_CENTER_COLOR);
+      
+      // Draw tiny dot to signify the stylus
+      spr.fillCircle(n_x, n_y, 3, NP_TONEARM_DOT_COLOR);
+  } else {
+      for (int t = -(NP_TONEARM_THICKNESS / 2); t <= (NP_TONEARM_THICKNESS / 2); t++) {
+          tft.drawLine(p_x + t, p_y, n_x + t, n_y, arm_color);
+          tft.drawLine(p_x, p_y + t, n_x, n_y + t, arm_color);
+      }
+      tft.fillCircle(p_x, p_y, 11 + (NP_TONEARM_THICKNESS / 2), NP_TONEARM_BASE_COLOR);
+      tft.fillCircle(p_x, p_y, 6 + (NP_TONEARM_THICKNESS / 2), arm_color);
+      tft.fillCircle(p_x, p_y, 3, NP_TONEARM_BASE_CENTER_COLOR);
+      
+      // Draw tiny dot to signify the stylus
+      tft.fillCircle(n_x, n_y, 3, NP_TONEARM_DOT_COLOR);
   }
-  tft.fillCircle(p_x, p_y, 11 + (NP_TONEARM_THICKNESS / 2), NP_TONEARM_BASE_COLOR);
-  tft.fillCircle(p_x, p_y, 6 + (NP_TONEARM_THICKNESS / 2), arm_color);
-  tft.fillCircle(p_x, p_y, 3, NP_TONEARM_BASE_CENTER_COLOR);
-  
-  // Draw tiny dot to signify the stylus
-  tft.fillCircle(n_x, n_y, 3, NP_TONEARM_DOT_COLOR);
 }
 
 static bool np_needs_full_redraw = true;
@@ -672,24 +691,21 @@ static void draw_now_playing() {
         last_vinyl_draw_time = millis();
     }
 
-    // Optimization: Don't redraw direct-to-screen vinyl unless it actually rotated enough to matter
-    static float last_rendered_angle = -999.0f;
-    bool angle_changed = abs(current_rotation_angle - last_rendered_angle) > 0.02f; // ~1 degree
-
     if (!np_show_square_art && current_track_info.local_album_idx >= 0) {
-      if (angle_changed || initial_draw || last_square_state != np_show_square_art) {
-        // Draw white outline
-        tft.drawCircle(SCREEN_W / 2, NP_ART_CENTER_Y, NP_VINYL_OUTER_RADIUS + 1, TFT_WHITE);
-        
-        drawLocalAlbumArt(SCREEN_W / 2, NP_ART_CENTER_Y,
-                          current_track_info.local_album_idx);
-        draw_tonearm();
-        last_rendered_angle = current_rotation_angle;
-      }
+      // VINYL BUFFERED MODE: Fixes flicker and dramatically speeds up rendering
+      spr.fillSprite(TFT_BLACK);
+      
+      // Draw white outline in sprite context
+      spr.drawCircle(SCREEN_W / 2, NP_ART_CENTER_Y - 50, NP_VINYL_OUTER_RADIUS + 1, TFT_WHITE);
+      
+      drawLocalAlbumArt(SCREEN_W / 2, NP_ART_CENTER_Y,
+                        current_track_info.local_album_idx, true, 50);
+      draw_tonearm(true, 50);
+      spr.pushSprite(0, 50);
     } else {
       if (current_track_info.local_album_idx >= 0) {
         drawLocalAlbumArt(SCREEN_W / 2, NP_ART_CENTER_Y,
-                          current_track_info.local_album_idx);
+                          current_track_info.local_album_idx, false, 0);
       } else {
         // TODO: In the future we need to implement rotation for JPEG decoder,
         // For now, if we don't have local cache, just draw it standard using JPEG
@@ -697,16 +713,15 @@ static void draw_now_playing() {
                      npSeek, JPEGDraw_NowPlaying);
         // Just raw scale down, no rotation supported yet natively in jpeglib
         int w = jpeg_np.getWidth();
-        int h = jpeg_np.getHeight();
         int scale =
             (w >= 400) ? JPEG_SCALE_QUARTER : ((w >= 200) ? JPEG_SCALE_HALF : 0);
         np_img_x = (SCREEN_W / 2) - (w / 2);
-        np_img_y = NP_ART_CENTER_Y - (h / 2);
+        np_img_y = NP_ART_CENTER_Y - (jpeg_np.getHeight() / 2);
         jpeg_np.decode(0, 0, scale);
         jpeg_np.close();
       }
       // Draw Tonearm AFTER the vinyl image is fully committed to the screen
-      draw_tonearm();
+      draw_tonearm(false, 0);
     }
     
     last_square_state = np_show_square_art;
@@ -763,7 +778,17 @@ static void draw_ui() {
 // ============================================================
 
 void ui_init() {
-  // We no longer allocate the 83.2KB Sprite. This guarantees Spotify TLS connection success.
+  // CRITICAL: Create sprite FIRST — it's the largest allocation (89.6KB)
+  // and must succeed for any display to work
+  if (!sprite_created) {
+    spr.setColorDepth(16);
+    if (spr.createSprite(SCREEN_W, SPRITE_H) == nullptr) {
+      Serial.println("SPRITE ALLOCATION FAILED");
+    } else {
+      sprite_created = true;
+      Serial.println("Sprite created OK");
+    }
+  }
 
   // Now allocate cache slots from remaining heap
   Serial.print("Free heap: ");
@@ -777,11 +802,21 @@ void ui_init() {
 }
 
 void ui_suspend_sprite() {
-  // Empty stub: Direct draw uses 0 RAM overhead!
+  if (sprite_created) {
+    spr.deleteSprite();
+    sprite_created = false;
+  }
 }
 
 void ui_resume_sprite() {
-  // Empty stub: Direct draw uses 0 RAM overhead!
+  if (!sprite_created) {
+    if (spr.createSprite(SCREEN_W, SPRITE_H) != nullptr) {
+      sprite_created = true;
+      // We don't draw immediately; the next loop cycle calling ui_update() will handle redrawing
+    } else {
+      Serial.println("FAILED TO RESUME SPRITE! OUT OF RAM!");
+    }
+  }
 }
 
 void ui_update() {

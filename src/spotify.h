@@ -20,6 +20,7 @@ struct SpotifyTrackInfo {
     uint32_t progress_ms;
     uint32_t duration_ms;
     char album_art_url[128];
+    int local_album_idx;
 };
 
 extern SpotifyTrackInfo current_track_info;

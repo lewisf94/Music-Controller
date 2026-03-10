@@ -27,45 +27,8 @@ except ImportError:
 
 TARGET_SIZE = (80, 80)
 
-# Manual metadata overrides: filename_stem -> (title, artist, spotify_uri)
-# Add entries here for non-standard filenames or to set Spotify URIs
-METADATA_OVERRIDES = {
-    "Aha_Shake_Heartbreak-Kings_of_Leon":
-        ("Aha Shake Heartbreak", "Kings of Leon", "spotify:album:5CnpZV3q5BcESefcB3WJmz"),
-    "Arctic_Monkeys_\u2013_Tranquility_Base_Hotel_&_Casino":
-        ("Tranquility Base Hotel & Casino", "Arctic Monkeys", "spotify:album:1jeMiSeSnNS0Oys375qegp"),
-    "Cage_the_Elephant_Social_Cues":
-        ("Social Cues", "Cage the Elephant", "spotify:album:41bTjJBZMFBVMI9GtNNriq"),
-    "Fontaines_D.C.-Skinty_Fia":
-        ("Skinty Fia", "Fontaines D.C.", "spotify:album:3GqMHMTyoMEiRWsPtCEMCz"),
-    "Gorillaz (Gorillaz)_2001_album":
-        ("Gorillaz", "Gorillaz", "spotify:album:0bUTHlWbkSQysoM3VsWldT"),
-    "Grian_Chatten-Chaos_for_the_Fly":
-        ("Chaos for the Fly", "Grian Chatten", "spotify:album:2vbsM0VHzIxsPMFbkKyqTa"),
-    "Kendrick_Lamar-To_Pimp_a_Butterfly":
-        ("To Pimp a Butterfly", "Kendrick Lamar", "spotify:album:7ycBtnsMtyVbbwTfJwRjSP"),
-    "Loyle_Carner_-_Hugo":
-        ("Hugo", "Loyle Carner", "spotify:album:2ryMzFzazSdEJxMEVJkkRB"),
-    "Magdalena_Bay-Imaginal_Disk":
-        ("Imaginal Disk", "Magdalena Bay", "spotify:album:2IysJM9VNnOWLhhIhj4eNo"),
-    "Plasticbeach-Gorillaz":
-        ("Plastic Beach", "Gorillaz", "spotify:album:2dIGnmEIy1WZIcZCFSj6i8"),
-    "The_Strokes-Is_This_It_cover":
-        ("Is This It", "The Strokes", "spotify:album:2k8KgmDp9oHrJlJlkyjMrB"),
-    "The_Strokes-The_New_Abnormal":
-        ("The New Abnormal", "The Strokes", "spotify:album:2xkZV2Hl1Omi1fDP7xaujy"),
-    "What_Went_Down-Foals":
-        ("What Went Down", "Foals", "spotify:album:5wHFPIn5SqfOaHNkShfnZr"),
-    "Whatever_People_Say_I_Am,_That's_What_I'm_Not_(2006_Arctic_Monkeys_album)":
-        ("Whatever People Say I Am", "Arctic Monkeys", "spotify:album:6rsQnwaoJHxXJRCDBPIYfL"),
-}
-
-
 def guess_metadata(filename_stem):
     """Try to guess title and artist from filename. Falls back to filename as title."""
-    # Check overrides first
-    if filename_stem in METADATA_OVERRIDES:
-        return METADATA_OVERRIDES[filename_stem]
 
     # Try splitting on hyphen: "Artist-Album_Title"
     if '-' in filename_stem:
@@ -113,15 +76,26 @@ def process_directory(input_dir, output_dir):
             title, artist, uri = guess_metadata(stem)
             albums.append((bin_filename, title, artist, uri))
 
-    # Write metadata.csv
+    # 1. Read existing metadata.csv to preserve user-added URIs
+    existing_uris = {}
     csv_path = os.path.join(output_dir, "metadata.csv")
+    if os.path.exists(csv_path):
+        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 4 and row[3].strip():
+                    existing_uris[row[0]] = row[3].strip()
+
+    # 2. Write updated metadata.csv
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        for bin_name, title, artist, uri in albums:
-            writer.writerow([bin_name, title, artist, uri])
+        for bin_name, title, artist, default_uri in albums:
+            # Prefer the URI they already typed in the CSV over the script default
+            final_uri = existing_uris.get(bin_name, default_uri)
+            writer.writerow([bin_name, title, artist, final_uri])
 
     print(f"\n  Done! {len(albums)} albums converted.")
-    print(f"  Metadata written to: {csv_path}")
+    print(f"  Metadata written to: {csv_path} (Existing Spotify URIs were preserved!)")
     print(f"\n  Copy the entire '{os.path.basename(output_dir)}' folder to your SD card root.")
 
 

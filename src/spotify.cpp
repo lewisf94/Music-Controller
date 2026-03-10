@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include "mbedtls/base64.h"
 #include <SD.h>
+#include "ui.h"
 
 static const char* wifi_ssid;
 static const char* wifi_password;
@@ -15,17 +16,20 @@ static const char* refresh_token;
 static String access_token = "";
 static unsigned long token_expiry = 0;
 
-SpotifyTrackInfo current_track_info = {false, "", "", "", 0, 0, ""};
+SpotifyTrackInfo current_track_info = {false, "", "", "", 0, 0, "", -1};
 bool track_info_updated = false;
 
 static void download_album_art(const char* url) {
     if (WiFi.status() != WL_CONNECTED) return;
+    
+    ui_suspend_sprite();
     WiFiClientSecure *client = new WiFiClientSecure;
     client->setInsecure();
     HTTPClient https;
     if (https.begin(*client, url)) {
         int httpCode = https.GET();
         if (httpCode == HTTP_CODE_OK) {
+            SD.remove("/sd_card_albums/nowplaying.jpg");
             File f = SD.open("/sd_card_albums/nowplaying.jpg", FILE_WRITE);
             if (f) {
                 https.writeToStream(&f);
@@ -38,36 +42,10 @@ static void download_album_art(const char* url) {
     }
     https.end();
     delete client;
+    ui_resume_sprite();
 }
 
-void copy_album_art(const char* src_filename) {
-    char path[128];
-    snprintf(path, sizeof(path), "/sd_card_albums/%s", src_filename);
-    
-    File src = SD.open(path, FILE_READ);
-    if (!src) {
-        Serial.println("Failed to open source image for copy");
-        return;
-    }
-    
-    File dst = SD.open("/sd_card_albums/nowplaying.jpg", FILE_WRITE);
-    if (!dst) {
-        Serial.println("Failed to open destination image for copy");
-        src.close();
-        return;
-    }
-    
-    // Copy data
-    uint8_t buf[512];
-    while (src.available()) {
-        int len = src.read(buf, 512);
-        dst.write(buf, len);
-    }
-    
-    src.close();
-    dst.close();
-    Serial.println("Copied album art for local simulation");
-}
+
 
 // DigiCert Global Root G2 (used by accounts.spotify.com and api.spotify.com)
 static const char* const spotify_ca =
@@ -104,6 +82,7 @@ void spotify_init(const char* ssid, const char* password, const char* clientId, 
 void refresh_access_token() {
     if (WiFi.status() != WL_CONNECTED) return;
     
+    ui_suspend_sprite();
     WiFiClientSecure *client = new WiFiClientSecure;
     client->setInsecure(); // Use insecure for auth slightly faster, we'll secure the API later
 
@@ -130,6 +109,7 @@ void refresh_access_token() {
         https.end();
     }
     delete client;
+    ui_resume_sprite();
 }
 
 void spotify_update() {
@@ -141,8 +121,16 @@ void spotify_update() {
         printed_connected = true;
     }
 
+    static unsigned long last_auth_attempt = 0;
+    static bool auth_attempted = false;
+    
+    // Attempt auth if token is missing/expired, but no more than once every 5 seconds to prevent memory leaks/freezes
     if (access_token == "" || millis() > token_expiry) {
-        refresh_access_token();
+        if (!auth_attempted || millis() - last_auth_attempt > 5000) {
+            auth_attempted = true;
+            last_auth_attempt = millis();
+            refresh_access_token();
+        }
     }
 
     static unsigned long last_fetch = 0;
@@ -157,6 +145,7 @@ void spotify_update() {
 bool spotify_play_album(const char* album_uri) {
     if (access_token == "" || WiFi.status() != WL_CONNECTED) return false;
 
+    ui_suspend_sprite();
     WiFiClientSecure *client = new WiFiClientSecure;
     client->setInsecure(); // skipping cert validation for now for speed
 
@@ -170,6 +159,7 @@ bool spotify_play_album(const char* album_uri) {
         int httpCode = https.PUT(payload);
         https.end();
         delete client;
+        ui_resume_sprite();
         
         if (httpCode == 204 || httpCode == 200) {
             Serial.println("Playback Started!");
@@ -180,12 +170,14 @@ bool spotify_play_album(const char* album_uri) {
         }
     }
     delete client;
+    ui_resume_sprite();
     return false;
 }
 
 void spotify_fetch_currently_playing() {
     if (access_token == "" || WiFi.status() != WL_CONNECTED) return;
 
+    ui_suspend_sprite();
     WiFiClientSecure *client = new WiFiClientSecure;
     client->setInsecure();
 
@@ -207,6 +199,7 @@ void spotify_fetch_currently_playing() {
                 
                 current_track_info.progress_ms = doc["progress_ms"].as<uint32_t>();
                 current_track_info.duration_ms = doc["item"]["duration_ms"].as<uint32_t>();
+                current_track_info.local_album_idx = -1;
                 
                 bool song_changed = strncmp(current_track_info.title, new_title, 63) != 0;
                 
@@ -221,7 +214,11 @@ void spotify_fetch_currently_playing() {
                     strncpy(current_track_info.album_art_url, new_url, 127);
                     current_track_info.album_art_url[127] = '\0';
                     if (new_url[0] != '\0') {
+                        // Pass through to download_album_art which has its own suspend/resume,
+                        // so we momentarily resume before calling it.
+                        ui_resume_sprite();
                         download_album_art(new_url);
+                        ui_suspend_sprite();
                     }
                 }
                 track_info_updated = true;
@@ -234,4 +231,5 @@ void spotify_fetch_currently_playing() {
     }
     https.end();
     delete client;
+    ui_resume_sprite();
 }
